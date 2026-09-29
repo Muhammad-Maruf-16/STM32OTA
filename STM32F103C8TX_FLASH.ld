@@ -48,6 +48,7 @@ MEMORY
   FLASH    (rx)    : ORIGIN = 0x08001000,   LENGTH = 60K
 }
 
+
 /* Sections */
 SECTIONS
 {
