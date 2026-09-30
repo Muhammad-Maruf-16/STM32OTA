@@ -24,9 +24,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "lfs_config.h"
-#include "mqtt_config.h"
-#include "web_config.h"
+#include "dhcp.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -95,7 +93,13 @@ static uint8_t ram_buffer[CHUNK_BUFFER_SIZE];
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+//extern volatile uint32_t g_ms_tick;
+volatile uint32_t g_ms_tick = 0;
+uint8_t g_phy_reg = 0;
+uint8_t g_dbg_s0_test = 0;
+uint8_t g_dbg_s1_test = 0;
+uint8_t g_dbg_test2 = 0;
+uint8_t g_dbg_test3 = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -328,67 +332,114 @@ void W5500_ReadBuf(uint16_t addr, uint8_t block, uint8_t *buf, uint16_t len)
   LL_GPIO_SetOutputPin(ETH_CS_GPIO_Port, ETH_CS_Pin);
 }
 
+//static
+
+//void W5500_InitNetwork(void)
+//{
+//  LL_GPIO_ResetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
+//  for (volatile int i = 0; i < 72000; i++);
+//  LL_GPIO_SetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
+//  for (volatile int i = 0; i < 720000; i++);
+//
+//  uint8_t mac[] = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x33};
+//  uint8_t ip[]  = {172, 155, 0, 200};
+//  uint8_t sub[] = {255, 255, 252, 0};
+//  uint8_t gw[]  = {172, 155, 0, 1};
+//
+//  W5500_WriteBuf(0x0001, W5500_COMMON_REG_OP, gw, 4);
+//  W5500_WriteBuf(0x0005, W5500_COMMON_REG_OP, sub, 4);
+//  W5500_WriteBuf(0x0009, W5500_COMMON_REG_OP, mac, 6);
+//  W5500_WriteBuf(0x000F, W5500_COMMON_REG_OP, ip, 4);
+//
+//  // Alokasi 8KB RX & 8KB TX ke Socket 0
+//  W5500_WriteReg(0x001E, W5500_S0_REG_OP, 8);
+//  W5500_WriteReg(0x001F, W5500_S0_REG_OP, 8);
+//}
 
 void W5500_InitNetwork(void)
 {
-  LL_GPIO_ResetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
-  for (volatile int i = 0; i < 72000; i++);
-  LL_GPIO_SetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
-  for (volatile int i = 0; i < 720000; i++);
+    // Reset W5500
+    LL_GPIO_ResetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
+    for (volatile int i = 0; i < 72000; i++);
+    LL_GPIO_SetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
+    for (volatile int i = 0; i < 720000; i++);
 
-  uint8_t mac[] = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x33};
-  uint8_t ip[]  = {172, 155, 0, 200};
-  uint8_t sub[] = {255, 255, 252, 0};
-  uint8_t gw[]  = {172, 155, 0, 1};
+    // Set MAC saja — IP, subnet, gateway diurus DHCP
+    uint8_t mac[] = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x33};
+    W5500_WriteBuf(0x0009, W5500_COMMON_REG_OP, mac, 6);
 
-  W5500_WriteBuf(0x0001, W5500_COMMON_REG_OP, gw, 4);
-  W5500_WriteBuf(0x0005, W5500_COMMON_REG_OP, sub, 4);
-  W5500_WriteBuf(0x0009, W5500_COMMON_REG_OP, mac, 6);
-  W5500_WriteBuf(0x000F, W5500_COMMON_REG_OP, ip, 4);
+    uint8_t sub[] = {0, 0, 0, 0};
+    uint8_t gw[]  = {0, 0, 0, 0};
+    uint8_t ip[]  = {0, 0, 0, 0};
+    W5500_WriteBuf(0x0001, W5500_COMMON_REG_OP, gw,  4);
+    W5500_WriteBuf(0x0005, W5500_COMMON_REG_OP, sub, 4);
+    W5500_WriteBuf(0x000F, W5500_COMMON_REG_OP, ip,  4);
 
-  // Alokasi 8KB RX & 8KB TX ke Socket 0
-  W5500_WriteReg(0x001E, W5500_S0_REG_OP, 8);
-  W5500_WriteReg(0x001F, W5500_S0_REG_OP, 8);
+    // Alokasi buffer socket (tetap sama)
+
+//    W5500_WriteReg(0x001E, W5500_S0_REG_OP, 4);  // Socket 0: 4KB RX
+//    W5500_WriteReg(0x001F, W5500_S0_REG_OP, 4);  // Socket 0: 4KB TX
+//    W5500_WriteReg(0x001E, 0x10,            2);  // Socket 1: 2KB RX
+//    W5500_WriteReg(0x001F, 0x10,            2);  // Socket 1: 2KB TX
+    // Socket 0: 4KB RX + TX
+    W5500_WriteReg(0x001E, W5500_S0_REG_OP, 8);  // ← block 0x08 = Socket 0 Reg ✅
+    W5500_WriteReg(0x001F, W5500_S0_REG_OP, 8);  // ← block 0x08 = Socket 0 Reg ✅
+
+
+    W5500_WriteReg(0x001E, 0x28, 2);
+        W5500_WriteReg(0x001F, 0x28, 2);
+}
+
+static void W5500_WaitCR(uint8_t block, uint32_t timeout_ms)
+{
+    uint32_t t = g_ms_tick;
+    while (W5500_ReadReg(Sn_CR, block)) {
+        if ((g_ms_tick - t) > timeout_ms) break;
+    }
+}
+
+static void W5500_WaitSR(uint8_t block, uint8_t expected, uint32_t timeout_ms)
+{
+    uint32_t t = g_ms_tick;
+    while (W5500_ReadReg(Sn_SR, block) != expected) {
+        if ((g_ms_tick - t) > timeout_ms) break;
+    }
 }
 
 void W5500_SocketOpenListen(uint16_t port)
 {
-  // Tutup dulu untuk memastikan socket bersih
-  W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_CLOSE);
-  while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+    W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_CLOSE);
+    W5500_WaitCR(W5500_S0_REG_OP, 10);
 
-  // Set mode TCP
-  W5500_WriteReg(Sn_MR, W5500_S0_REG_OP, 0x01);
+    W5500_WriteReg(Sn_MR, W5500_S0_REG_OP, 0x01);
 
-  // Set Port 80
-  W5500_WriteReg(Sn_PORT, W5500_S0_REG_OP, (uint8_t)(port >> 8));
-  W5500_WriteReg(Sn_PORT + 1, W5500_S0_REG_OP, (uint8_t)port);
+    W5500_WriteReg(Sn_PORT,     W5500_S0_REG_OP, (uint8_t)(port >> 8));
+    W5500_WriteReg(Sn_PORT + 1, W5500_S0_REG_OP, (uint8_t)port);
 
-  // Buka Socket
-  W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_OPEN);
-  while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+    W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_OPEN);
+    W5500_WaitCR(W5500_S0_REG_OP, 10);
 
-  // WAJIB: Tunggu sampai register status berubah jadi SOCK_INIT (0x13)
-  while (W5500_ReadReg(Sn_SR, W5500_S0_REG_OP) != SOCK_INIT);
+    W5500_WaitSR(W5500_S0_REG_OP, SOCK_INIT, 50);
 
-  // Masuk ke mode LISTEN
-  W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_LISTEN);
-  while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
-  while (W5500_ReadReg(Sn_SR, W5500_S0_REG_OP) != SOCK_LISTEN); // WAJIB tunggu LISTEN!
+    W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_LISTEN);
+    W5500_WaitCR(W5500_S0_REG_OP, 10);
+    W5500_WaitSR(W5500_S0_REG_OP, SOCK_LISTEN, 50);
 }
+
+
 
 void W5500_SendTCP(const uint8_t *data, uint16_t len)
 {
-  uint16_t ptr = ((uint16_t)W5500_ReadReg(Sn_TX_WR, W5500_S0_REG_OP) << 8) |
-                 W5500_ReadReg(Sn_TX_WR + 1, W5500_S0_REG_OP);
+    uint16_t ptr = ((uint16_t)W5500_ReadReg(Sn_TX_WR,     W5500_S0_REG_OP) << 8) |
+                               W5500_ReadReg(Sn_TX_WR + 1, W5500_S0_REG_OP);
 
-  W5500_WriteBuf(ptr, W5500_S0_TX_OP, data, len);
-  ptr += len;
+    W5500_WriteBuf(ptr, W5500_S0_TX_OP, data, len);
+    ptr += len;
 
-  W5500_WriteReg(Sn_TX_WR, W5500_S0_REG_OP, (uint8_t)(ptr >> 8));
-  W5500_WriteReg(Sn_TX_WR + 1, W5500_S0_REG_OP, (uint8_t)ptr);
-  W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_SEND);
-  while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+    W5500_WriteReg(Sn_TX_WR,     W5500_S0_REG_OP, (uint8_t)(ptr >> 8));
+    W5500_WriteReg(Sn_TX_WR + 1, W5500_S0_REG_OP, (uint8_t)ptr);
+    W5500_WriteReg(Sn_CR,        W5500_S0_REG_OP, CMD_SEND);
+    W5500_WaitCR(W5500_S0_REG_OP, 10);
 }
 
 // ==============================================================================
@@ -456,23 +507,7 @@ void Process_Web_OTA(void)
   }
   ram_buffer[fetch] = '\0';
 
-  if (strstr((char *)ram_buffer, "/config") != NULL) {
-       WebConfig_Handle(ram_buffer, fetch);
 
-       rx_rd += rx_len;
-       W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
-       W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
-       W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
-       while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
-       W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_DISCON);
-       while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
-       return;
-   }
-
-   // Handler GET / yang sudah ada tetap di bawahnya
-   if (strstr((char *)ram_buffer, "GET /") != NULL) {
-       // ... kode yang sudah ada ...
-   }
   // ============================================================
   // GET / — Kirim halaman web
   // ============================================================
@@ -755,6 +790,8 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
+  SysTick->CTRL |= SysTick_CTRL_TICKINT_Msk;
+
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -762,7 +799,7 @@ int main(void)
   MX_SPI1_Init();
   MX_SPI2_Init();
   MX_CRC_Init();
-  MX_IWDG_Init();
+//  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
   LL_SPI_Enable(SPI1);
   if (LL_SPI_IsActiveFlag_RXNE(SPI1)) {
@@ -785,11 +822,23 @@ int main(void)
   Flash_ReadBytes(FLASH_STAGING_META + 8, &dbg_flag, 1);
 
   W5500_InitNetwork();
-  LfsConfig_Init();      // Mount LittleFS (atau format kalau belum pernah)
-  WebConfig_Init();      // Tulis HTML ke flash kalau belum ada
+  DHCP_Init();
+  g_phy_reg = W5500_ReadReg(0x002E, 0x00);
 
-  MqttConfig_t g_mqtt_cfg;
-  MqttConfig_Load(&g_mqtt_cfg);   // Load config MQTT siap dipakai
+  W5500_WriteReg(0x0004, W5500_S0_REG_OP, 0xAB);
+  g_dbg_s0_test = W5500_ReadReg(0x0004, W5500_S0_REG_OP);
+
+  // Test write/read Socket 1
+  W5500_WriteReg(0x0004, 0x28, 0xCD);
+  g_dbg_s1_test = W5500_ReadReg(0x0004, 0x28);
+
+  W5500_WriteReg(0x0004, 0x28, 0xAB);  // PORT high → berhasil
+  W5500_WriteReg(0x0005, 0x28, 0xCD);  // PORT low
+  W5500_WriteReg(0x0006, 0x28, 0xFF);  // DHAR[0]
+  W5500_WriteReg(0x0007, 0x28, 0xFF);  // DHAR[1]
+
+  g_dbg_test2 = W5500_ReadReg(0x0006, 0x28);  // harus 0xFF
+  g_dbg_test3 = W5500_ReadReg(0x0007, 0x28);
 
   uint32_t led_tick = 0;
   /* USER CODE END 2 */
@@ -801,8 +850,15 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  Process_Web_OTA();
-	  LL_IWDG_ReloadCounter(IWDG);
+//	  Process_Web_OTA();
+	  DHCP_Process();           // Proses DHCP setiap loop
+
+	        // Jalankan web OTA hanya kalau sudah dapat IP
+	  if (DHCP_IsBound())
+	  {
+		  Process_Web_OTA();
+	  }
+//	  LL_IWDG_ReloadCounter(IWDG);
 
 	  if (++led_tick > 100000)
 	  {
