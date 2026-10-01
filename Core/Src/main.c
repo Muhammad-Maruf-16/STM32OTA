@@ -25,6 +25,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "dhcp.h"
+#include "mqtt_config.h"
+#include "web_config.h"
+#include "mqtt_client.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,6 +38,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 //#define OTA_MODE_BACKUP
+//#define MAIN_DEBUG
+#define DEBUG_MQTT
 #define APP_START_ADDR        0x08001000U
 #define MAX_FIRMWARE_SIZE     (28 * 1024)
 
@@ -43,10 +48,6 @@
 
 #define FLASH_STAGING_META    0x00020000U
 #define FLASH_STAGING_BIN     0x00021000U
-
-//#define FLASH_HTML_META   0x00030000U
-//#define FLASH_HTML_DATA   0x00100000U
-//#define MAX_HTML_SIZE     (1024 * 1024)
 
 #define W5500_COMMON_REG_OP   0x00
 #define W5500_S0_REG_OP       0x08
@@ -78,11 +79,9 @@
 #define CMD_SEND              0x20
 #define CMD_RECV              0x40
 
-#define W5500_S0_BUF_MASK    0x1FFF
-#define CHUNK_BUFFER_SIZE    (256)
+#define W5500_S0_BUF_MASK     0x1FFF
+#define CHUNK_BUFFER_SIZE     (256)
 static uint8_t ram_buffer[CHUNK_BUFFER_SIZE];
-
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -93,13 +92,21 @@ static uint8_t ram_buffer[CHUNK_BUFFER_SIZE];
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-//extern volatile uint32_t g_ms_tick;
 volatile uint32_t g_ms_tick = 0;
 uint8_t g_phy_reg = 0;
+#ifdef MAIN_DEBUG
 uint8_t g_dbg_s0_test = 0;
 uint8_t g_dbg_s1_test = 0;
-uint8_t g_dbg_test2 = 0;
-uint8_t g_dbg_test3 = 0;
+uint8_t g_dbg_test2   = 0;
+uint8_t g_dbg_test3   = 0;
+#endif
+
+#ifdef DEBUG_MQTT
+uint8_t g_dbg_s2_tx_size = 0;
+uint8_t g_dbg_s2_sr     = 0;
+uint8_t g_dbg_s2_fsr_hi = 0;
+uint8_t g_dbg_s2_fsr_lo = 0;
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -116,6 +123,9 @@ static void MX_IWDG_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+// ==============================================================================
+// 1. DRIVER SPI1 - FLASH EKSTERNAL
+// ==============================================================================
 static inline uint8_t SPI1_Transfer(uint8_t data)
 {
   while (!LL_SPI_IsActiveFlag_TXE(SPI1));
@@ -146,7 +156,7 @@ void ExtFlash_EraseSector(uint32_t addr)
 {
   ExtFlash_WriteEnable();
   LL_GPIO_ResetOutputPin(FLASH_CS_GPIO_Port, FLASH_CS_Pin);
-  SPI1_Transfer(0x20); // 4KB Sector Erase
+  SPI1_Transfer(0x20);
   SPI1_Transfer((uint8_t)(addr >> 16));
   SPI1_Transfer((uint8_t)(addr >> 8));
   SPI1_Transfer((uint8_t)addr);
@@ -158,13 +168,11 @@ void ExtFlash_WritePage(uint32_t addr, const uint8_t *data, uint16_t len)
 {
   ExtFlash_WriteEnable();
   LL_GPIO_ResetOutputPin(FLASH_CS_GPIO_Port, FLASH_CS_Pin);
-  SPI1_Transfer(0x02); // Page Program (maks 256B)
+  SPI1_Transfer(0x02);
   SPI1_Transfer((uint8_t)(addr >> 16));
   SPI1_Transfer((uint8_t)(addr >> 8));
   SPI1_Transfer((uint8_t)addr);
-  for (uint16_t i = 0; i < len; i++) {
-    SPI1_Transfer(data[i]);
-  }
+  for (uint16_t i = 0; i < len; i++) SPI1_Transfer(data[i]);
   LL_GPIO_SetOutputPin(FLASH_CS_GPIO_Port, FLASH_CS_Pin);
   ExtFlash_WaitBusy();
 }
@@ -176,84 +184,67 @@ void Flash_ReadBytes(uint32_t addr, uint8_t *buf, uint32_t len)
   SPI1_Transfer((uint8_t)(addr >> 16));
   SPI1_Transfer((uint8_t)(addr >> 8));
   SPI1_Transfer((uint8_t)addr);
-  for (uint32_t i = 0; i < len; i++) {
-    buf[i] = SPI1_Transfer(0xFF);
-  }
+  for (uint32_t i = 0; i < len; i++) buf[i] = SPI1_Transfer(0xFF);
   LL_GPIO_SetOutputPin(FLASH_CS_GPIO_Port, FLASH_CS_Pin);
 }
 
 uint32_t Hitung_CRC32_LL(const uint32_t *pData32, uint32_t totalWord)
 {
   CRC->CR = 1;
-  while (totalWord--) {
-    CRC->DR = *pData32++;
-  }
+  while (totalWord--) CRC->DR = *pData32++;
   return CRC->DR;
 }
 
 // ==============================================================================
-// 2. FUNGSI SELF-BACKUP (Mencadangkan firmware yang sedang jalan ke Slot 0)
+// 2. FUNGSI SELF-BACKUP
 // ==============================================================================
 uint8_t Backup_CurrentFirmwareToExtFlash(uint32_t bin_size)
 {
   if (bin_size == 0 || bin_size > MAX_FIRMWARE_SIZE) return 0;
 
-  // A. Hitung CRC dari ROM Internal yang aktif
   uint32_t total_words = (bin_size + 3) / 4;
   uint32_t rom_crc = Hitung_CRC32_LL((const uint32_t *)APP_START_ADDR, total_words);
 
-  // B. Hapus Sektor Metadata dan Area Biner di Slot Backup
   ExtFlash_EraseSector(FLASH_BACKUP_META);
   uint32_t sectors = (bin_size + 4095) / 4096;
-  for (uint32_t s = 0; s < sectors; s++) {
+  for (uint32_t s = 0; s < sectors; s++)
     ExtFlash_EraseSector(FLASH_BACKUP_BIN + (s * 4096));
-  }
 
-  // C. Tulis ROM internal ke Flash Eksternal per halaman 256 byte
   uint32_t bytes_left = bin_size;
-  uint32_t cur_rom = APP_START_ADDR;
-  uint32_t cur_flash = FLASH_BACKUP_BIN;
-
+  uint32_t cur_rom    = APP_START_ADDR;
+  uint32_t cur_flash  = FLASH_BACKUP_BIN;
   while (bytes_left > 0) {
     uint16_t chunk = (bytes_left > 256) ? 256 : bytes_left;
     ExtFlash_WritePage(cur_flash, (const uint8_t *)cur_rom, chunk);
-    cur_rom += chunk;
+    cur_rom   += chunk;
     cur_flash += chunk;
     bytes_left -= chunk;
   }
 
-  // D. Verifikasi Hardware CRC dari Flash Eksternal yang baru ditulis
   CRC->CR = 1;
   uint32_t words_left = total_words;
-  uint32_t read_addr = FLASH_BACKUP_BIN;
-
+  uint32_t read_addr  = FLASH_BACKUP_BIN;
   while (words_left > 0) {
     uint32_t c_words = (words_left > 16) ? 16 : words_left;
     uint8_t temp[64];
     Flash_ReadBytes(read_addr, temp, c_words * 4);
     uint32_t *p = (uint32_t *)temp;
-    for (uint32_t w = 0; w < c_words; w++) {
-      CRC->DR = p[w];
-    }
-    read_addr += (c_words * 4);
+    for (uint32_t w = 0; w < c_words; w++) CRC->DR = p[w];
+    read_addr  += (c_words * 4);
     words_left -= c_words;
   }
 
-  // E. Jika CRC cocok, simpan Metadata Backup
   if (CRC->DR == rom_crc) {
     uint8_t meta[10] = {0};
-//    *(uint32_t *)&meta[0] = bin_size;
-//    *(uint32_t *)&meta[4] = rom_crc;
-	  meta[0] = (uint8_t)(bin_size);
-	  meta[1] = (uint8_t)(bin_size >> 8);
-	  meta[2] = (uint8_t)(bin_size >> 16);
-	  meta[3] = (uint8_t)(bin_size >> 24);
-
-	  meta[4] = (uint8_t)(rom_crc);
-	  meta[5] = (uint8_t)(rom_crc >> 8);
-	  meta[6] = (uint8_t)(rom_crc >> 16);
-	  meta[7] = (uint8_t)(rom_crc >> 24);
-    meta[8] = 0x00; // Flag 0x00 = Status valid/idle
+    meta[0] = (uint8_t)(bin_size);
+    meta[1] = (uint8_t)(bin_size >> 8);
+    meta[2] = (uint8_t)(bin_size >> 16);
+    meta[3] = (uint8_t)(bin_size >> 24);
+    meta[4] = (uint8_t)(rom_crc);
+    meta[5] = (uint8_t)(rom_crc >> 8);
+    meta[6] = (uint8_t)(rom_crc >> 16);
+    meta[7] = (uint8_t)(rom_crc >> 24);
+    meta[8] = 0x00;
     ExtFlash_WritePage(FLASH_BACKUP_META, meta, 10);
     return 1;
   }
@@ -263,27 +254,15 @@ uint8_t Backup_CurrentFirmwareToExtFlash(uint32_t bin_size)
 // ==============================================================================
 // 3. DRIVER SPI2 - W5500 ETHERNET BARE-METAL
 // ==============================================================================
-
-//static inline uint8_t SPI2_Transfer(uint8_t data)
-//{
-//  while (!LL_SPI_IsActiveFlag_TXE(SPI2));
-//  LL_SPI_TransmitData8(SPI2, data);
-//  while (!LL_SPI_IsActiveFlag_RXNE(SPI2));
-//  return LL_SPI_ReceiveData8(SPI2);
-//}
-
 static inline uint8_t SPI2_Transfer(uint8_t data)
 {
   uint32_t t = 200000;
   while (!LL_SPI_IsActiveFlag_TXE(SPI2))
     if (--t == 0) return 0xFF;
-
   LL_SPI_TransmitData8(SPI2, data);
-
   t = 200000;
   while (!LL_SPI_IsActiveFlag_RXNE(SPI2))
     if (--t == 0) return 0xFF;
-
   return LL_SPI_ReceiveData8(SPI2);
 }
 
@@ -292,7 +271,7 @@ void W5500_WriteReg(uint16_t addr, uint8_t block, uint8_t data)
   LL_GPIO_ResetOutputPin(ETH_CS_GPIO_Port, ETH_CS_Pin);
   SPI2_Transfer((uint8_t)(addr >> 8));
   SPI2_Transfer((uint8_t)addr);
-  SPI2_Transfer(block | 0x04); // Write mode
+  SPI2_Transfer(block | 0x04);
   SPI2_Transfer(data);
   LL_GPIO_SetOutputPin(ETH_CS_GPIO_Port, ETH_CS_Pin);
 }
@@ -302,7 +281,7 @@ uint8_t W5500_ReadReg(uint16_t addr, uint8_t block)
   LL_GPIO_ResetOutputPin(ETH_CS_GPIO_Port, ETH_CS_Pin);
   SPI2_Transfer((uint8_t)(addr >> 8));
   SPI2_Transfer((uint8_t)addr);
-  SPI2_Transfer(block | 0x00); // Read mode
+  SPI2_Transfer(block | 0x00);
   uint8_t val = SPI2_Transfer(0xFF);
   LL_GPIO_SetOutputPin(ETH_CS_GPIO_Port, ETH_CS_Pin);
   return val;
@@ -314,9 +293,7 @@ void W5500_WriteBuf(uint16_t addr, uint8_t block, const uint8_t *buf, uint16_t l
   SPI2_Transfer((uint8_t)(addr >> 8));
   SPI2_Transfer((uint8_t)addr);
   SPI2_Transfer(block | 0x04);
-  for (uint16_t i = 0; i < len; i++) {
-    SPI2_Transfer(buf[i]);
-  }
+  for (uint16_t i = 0; i < len; i++) SPI2_Transfer(buf[i]);
   LL_GPIO_SetOutputPin(ETH_CS_GPIO_Port, ETH_CS_Pin);
 }
 
@@ -326,126 +303,76 @@ void W5500_ReadBuf(uint16_t addr, uint8_t block, uint8_t *buf, uint16_t len)
   SPI2_Transfer((uint8_t)(addr >> 8));
   SPI2_Transfer((uint8_t)addr);
   SPI2_Transfer(block | 0x00);
-  for (uint16_t i = 0; i < len; i++) {
-    buf[i] = SPI2_Transfer(0xFF);
-  }
+  for (uint16_t i = 0; i < len; i++) buf[i] = SPI2_Transfer(0xFF);
   LL_GPIO_SetOutputPin(ETH_CS_GPIO_Port, ETH_CS_Pin);
 }
 
-//static
-
-//void W5500_InitNetwork(void)
-//{
-//  LL_GPIO_ResetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
-//  for (volatile int i = 0; i < 72000; i++);
-//  LL_GPIO_SetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
-//  for (volatile int i = 0; i < 720000; i++);
-//
-//  uint8_t mac[] = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x33};
-//  uint8_t ip[]  = {172, 155, 0, 200};
-//  uint8_t sub[] = {255, 255, 252, 0};
-//  uint8_t gw[]  = {172, 155, 0, 1};
-//
-//  W5500_WriteBuf(0x0001, W5500_COMMON_REG_OP, gw, 4);
-//  W5500_WriteBuf(0x0005, W5500_COMMON_REG_OP, sub, 4);
-//  W5500_WriteBuf(0x0009, W5500_COMMON_REG_OP, mac, 6);
-//  W5500_WriteBuf(0x000F, W5500_COMMON_REG_OP, ip, 4);
-//
-//  // Alokasi 8KB RX & 8KB TX ke Socket 0
-//  W5500_WriteReg(0x001E, W5500_S0_REG_OP, 8);
-//  W5500_WriteReg(0x001F, W5500_S0_REG_OP, 8);
-//}
-
 void W5500_InitNetwork(void)
 {
-    // Reset W5500
-    LL_GPIO_ResetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
-    for (volatile int i = 0; i < 72000; i++);
-    LL_GPIO_SetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
-    for (volatile int i = 0; i < 720000; i++);
+  LL_GPIO_ResetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
+  for (volatile int i = 0; i < 72000; i++);
+  LL_GPIO_SetOutputPin(ETH_RST_GPIO_Port, ETH_RST_Pin);
+  for (volatile int i = 0; i < 720000; i++);
 
-    // Set MAC saja — IP, subnet, gateway diurus DHCP
-    uint8_t mac[] = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x33};
-    W5500_WriteBuf(0x0009, W5500_COMMON_REG_OP, mac, 6);
+  // Set MAC — IP/subnet/gateway diurus DHCP
+  uint8_t mac[] = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x33};
+  uint8_t zero[] = {0, 0, 0, 0};
+  W5500_WriteBuf(0x0009, W5500_COMMON_REG_OP, mac,  6);
+  W5500_WriteBuf(0x0001, W5500_COMMON_REG_OP, zero, 4);  // GW
+  W5500_WriteBuf(0x0005, W5500_COMMON_REG_OP, zero, 4);  // Subnet
+  W5500_WriteBuf(0x000F, W5500_COMMON_REG_OP, zero, 4);  // IP
 
-    uint8_t sub[] = {0, 0, 0, 0};
-    uint8_t gw[]  = {0, 0, 0, 0};
-    uint8_t ip[]  = {0, 0, 0, 0};
-    W5500_WriteBuf(0x0001, W5500_COMMON_REG_OP, gw,  4);
-    W5500_WriteBuf(0x0005, W5500_COMMON_REG_OP, sub, 4);
-    W5500_WriteBuf(0x000F, W5500_COMMON_REG_OP, ip,  4);
-
-    // Alokasi buffer socket (tetap sama)
-
-//    W5500_WriteReg(0x001E, W5500_S0_REG_OP, 4);  // Socket 0: 4KB RX
-//    W5500_WriteReg(0x001F, W5500_S0_REG_OP, 4);  // Socket 0: 4KB TX
-//    W5500_WriteReg(0x001E, 0x10,            2);  // Socket 1: 2KB RX
-//    W5500_WriteReg(0x001F, 0x10,            2);  // Socket 1: 2KB TX
-    // Socket 0: 4KB RX + TX
-    W5500_WriteReg(0x001E, W5500_S0_REG_OP, 8);  // ← block 0x08 = Socket 0 Reg ✅
-    W5500_WriteReg(0x001F, W5500_S0_REG_OP, 8);  // ← block 0x08 = Socket 0 Reg ✅
-
-
-    W5500_WriteReg(0x001E, 0x28, 2);
-        W5500_WriteReg(0x001F, 0x28, 2);
+  // Alokasi buffer: Socket 0 = 8KB, Socket 1 = 2KB
+  W5500_WriteReg(0x001E, W5500_S0_REG_OP, 8);  // Socket 0 TX
+  W5500_WriteReg(0x001F, W5500_S0_REG_OP, 8);  // Socket 0 RX
+  W5500_WriteReg(0x001E, 0x28,            2);  // Socket 1 TX
+  W5500_WriteReg(0x001F, 0x28,            2);  // Socket 1 RX
 }
 
 static void W5500_WaitCR(uint8_t block, uint32_t timeout_ms)
 {
-    uint32_t t = g_ms_tick;
-    while (W5500_ReadReg(Sn_CR, block)) {
-        if ((g_ms_tick - t) > timeout_ms) break;
-    }
+  uint32_t t = g_ms_tick;
+  while (W5500_ReadReg(Sn_CR, block))
+    if ((g_ms_tick - t) > timeout_ms) break;
 }
 
 static void W5500_WaitSR(uint8_t block, uint8_t expected, uint32_t timeout_ms)
 {
-    uint32_t t = g_ms_tick;
-    while (W5500_ReadReg(Sn_SR, block) != expected) {
-        if ((g_ms_tick - t) > timeout_ms) break;
-    }
+  uint32_t t = g_ms_tick;
+  while (W5500_ReadReg(Sn_SR, block) != expected)
+    if ((g_ms_tick - t) > timeout_ms) break;
 }
 
 void W5500_SocketOpenListen(uint16_t port)
 {
-    W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_CLOSE);
-    W5500_WaitCR(W5500_S0_REG_OP, 10);
-
-    W5500_WriteReg(Sn_MR, W5500_S0_REG_OP, 0x01);
-
-    W5500_WriteReg(Sn_PORT,     W5500_S0_REG_OP, (uint8_t)(port >> 8));
-    W5500_WriteReg(Sn_PORT + 1, W5500_S0_REG_OP, (uint8_t)port);
-
-    W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_OPEN);
-    W5500_WaitCR(W5500_S0_REG_OP, 10);
-
-    W5500_WaitSR(W5500_S0_REG_OP, SOCK_INIT, 50);
-
-    W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_LISTEN);
-    W5500_WaitCR(W5500_S0_REG_OP, 10);
-    W5500_WaitSR(W5500_S0_REG_OP, SOCK_LISTEN, 50);
+  W5500_WriteReg(Sn_CR,      W5500_S0_REG_OP, CMD_CLOSE);
+  W5500_WaitCR(W5500_S0_REG_OP, 10);
+  W5500_WriteReg(Sn_MR,      W5500_S0_REG_OP, 0x01);
+  W5500_WriteReg(Sn_PORT,    W5500_S0_REG_OP, (uint8_t)(port >> 8));
+  W5500_WriteReg(Sn_PORT + 1,W5500_S0_REG_OP, (uint8_t)port);
+  W5500_WriteReg(Sn_CR,      W5500_S0_REG_OP, CMD_OPEN);
+  W5500_WaitCR(W5500_S0_REG_OP, 10);
+  W5500_WaitSR(W5500_S0_REG_OP, SOCK_INIT, 50);
+  W5500_WriteReg(Sn_CR,      W5500_S0_REG_OP, CMD_LISTEN);
+  W5500_WaitCR(W5500_S0_REG_OP, 10);
+  W5500_WaitSR(W5500_S0_REG_OP, SOCK_LISTEN, 50);
 }
-
-
 
 void W5500_SendTCP(const uint8_t *data, uint16_t len)
 {
-    uint16_t ptr = ((uint16_t)W5500_ReadReg(Sn_TX_WR,     W5500_S0_REG_OP) << 8) |
-                               W5500_ReadReg(Sn_TX_WR + 1, W5500_S0_REG_OP);
-
-    W5500_WriteBuf(ptr, W5500_S0_TX_OP, data, len);
-    ptr += len;
-
-    W5500_WriteReg(Sn_TX_WR,     W5500_S0_REG_OP, (uint8_t)(ptr >> 8));
-    W5500_WriteReg(Sn_TX_WR + 1, W5500_S0_REG_OP, (uint8_t)ptr);
-    W5500_WriteReg(Sn_CR,        W5500_S0_REG_OP, CMD_SEND);
-    W5500_WaitCR(W5500_S0_REG_OP, 10);
+  uint16_t ptr = ((uint16_t)W5500_ReadReg(Sn_TX_WR,     W5500_S0_REG_OP) << 8) |
+                             W5500_ReadReg(Sn_TX_WR + 1, W5500_S0_REG_OP);
+  W5500_WriteBuf(ptr, W5500_S0_TX_OP, data, len);
+  ptr += len;
+  W5500_WriteReg(Sn_TX_WR,     W5500_S0_REG_OP, (uint8_t)(ptr >> 8));
+  W5500_WriteReg(Sn_TX_WR + 1, W5500_S0_REG_OP, (uint8_t)ptr);
+  W5500_WriteReg(Sn_CR,        W5500_S0_REG_OP, CMD_SEND);
+  W5500_WaitCR(W5500_S0_REG_OP, 10);
 }
 
 // ==============================================================================
-// 4. WEB OTA HANDLER (HTTP POST /ota Stream Receiver)
+// 4. WEB OTA HANDLER
 // ==============================================================================
-// Halaman Web HTML mini sederhana langsung di-embed
 const char HTML_PAGE[] =
 "<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;padding:20px;'>"
 "<h2>STM32 OTA Web Uploader</h2>"
@@ -466,12 +393,10 @@ const char HTML_PAGE[] =
 "  let txt=await res.text();"
 "  document.getElementById('st').innerText=txt;"
 "}catch(e){"
-"   document.getElementById('st').innerText = 'Update Gagal! Coba lagi.'; "
-"}"
+"  document.getElementById('st').innerText='Update Gagal! Coba lagi.';}"
 "}"
 "</script></body></html>";
 
-// #define OTA_MODE_BACKUP
 void Process_Web_OTA(void)
 {
   uint8_t sr = W5500_ReadReg(Sn_SR, W5500_S0_REG_OP);
@@ -487,30 +412,158 @@ void Process_Web_OTA(void)
   }
   if (sr != SOCK_ESTABLISHED) return;
 
-  uint16_t rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR, W5500_S0_REG_OP) << 8) |
-                     W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
+  uint16_t rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR,     W5500_S0_REG_OP) << 8) |
+                               W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
   if (rx_len == 0) return;
 
-  uint16_t rx_rd = ((uint16_t)W5500_ReadReg(Sn_RX_RD, W5500_S0_REG_OP) << 8) |
-                    W5500_ReadReg(Sn_RX_RD + 1, W5500_S0_REG_OP);
+  uint16_t rx_rd = ((uint16_t)W5500_ReadReg(Sn_RX_RD,     W5500_S0_REG_OP) << 8) |
+                               W5500_ReadReg(Sn_RX_RD + 1, W5500_S0_REG_OP);
 
   uint16_t fetch = (rx_len > (CHUNK_BUFFER_SIZE - 1)) ? (CHUNK_BUFFER_SIZE - 1) : rx_len;
   uint16_t s_off = rx_rd & W5500_S0_BUF_MASK;
 
-  // Baca dengan proteksi wrap-around
   if ((s_off + fetch) > (W5500_S0_BUF_MASK + 1)) {
     uint16_t part1 = (W5500_S0_BUF_MASK + 1) - s_off;
-    W5500_ReadBuf(s_off,   W5500_S0_RX_OP, ram_buffer,         part1);
-    W5500_ReadBuf(0x0000,  W5500_S0_RX_OP, ram_buffer + part1, fetch - part1);
+    W5500_ReadBuf(s_off,  W5500_S0_RX_OP, ram_buffer,         part1);
+    W5500_ReadBuf(0x0000, W5500_S0_RX_OP, ram_buffer + part1, fetch - part1);
   } else {
     W5500_ReadBuf(s_off, W5500_S0_RX_OP, ram_buffer, fetch);
   }
   ram_buffer[fetch] = '\0';
 
+//	// ============================================================
+//	// /config — Halaman konfigurasi MQTT
+//	// ============================================================
+//	if (strstr((char *)ram_buffer, "/config") != NULL)
+//	{
+//		WebConfig_Handle(ram_buffer, fetch);
+//
+//		rx_rd += rx_len;
+//		W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+//		W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+//		W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
+//		while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+//			W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_DISCON);
+//		while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+//			return;
+//	}
+  // ============================================================
+  	// /config — Halaman konfigurasi MQTT
+  	// ============================================================
+  	if (strstr((char *)ram_buffer, "/config") != NULL)
+  	{
+  		// Cek apakah request berupa POST (Form submit)
+  		if (strstr((char *)ram_buffer, "POST") != NULL)
+  		{
+  			uint8_t tail[4] = {0};
+  			char *pBody = NULL;
 
-  // ============================================================
+  			// Stream per chunk 256 byte sampai delimiter "\r\n\r\n" ditemukan
+  			while (pBody == NULL) {
+  				uint8_t overlap[4 + CHUNK_BUFFER_SIZE];
+  				memcpy(overlap, tail, 4);
+  				memcpy(overlap + 4, ram_buffer, fetch);
+  				overlap[4 + fetch] = '\0';
+
+  				char *found = strstr((char *)overlap, "\r\n\r\n");
+  				if (found) {
+  					int pos_in_overlap = (found - (char *)overlap);
+  					int pos_in_buf     = pos_in_overlap - 4;
+  					int body_start     = pos_in_buf + 4;
+  					if (body_start < 0)     body_start = 0;
+  					if (body_start > fetch) body_start = fetch;
+  					pBody = (char *)ram_buffer + body_start;
+
+  					// Tandai penerimaan chunk ini ke W5500
+  					rx_rd += fetch;
+  					W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+  					W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+  					W5500_WriteReg(Sn_CR,        W5500_S0_REG_OP, CMD_RECV);
+  					while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+  				} else {
+  					memcpy(tail, ram_buffer + fetch - 4, 4);
+  					rx_rd += fetch;
+  					W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+  					W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+  					W5500_WriteReg(Sn_CR,        W5500_S0_REG_OP, CMD_RECV);
+  					while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+
+  					// Tarik chunk berikutnya
+  					rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR,     W5500_S0_REG_OP) << 8) |
+  					                     W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
+  					if (rx_len == 0) continue;
+  					fetch = (rx_len > (CHUNK_BUFFER_SIZE - 1)) ? (CHUNK_BUFFER_SIZE - 1) : rx_len;
+  					s_off = rx_rd & W5500_S0_BUF_MASK;
+  					W5500_ReadBuf(s_off, W5500_S0_RX_OP, ram_buffer, fetch);
+  					ram_buffer[fetch] = '\0';
+  				}
+  			}
+
+  			// Pindahkan sisa body yang terpotong ke awal ram_buffer
+  			uint16_t body_in_chunk = fetch - ((uint8_t *)pBody - ram_buffer);
+  			memmove(ram_buffer, pBody, body_in_chunk);
+  			ram_buffer[body_in_chunk] = '\0';
+
+  			// Jika body masih tersisa di buffer hardware W5500, ambil sisa byte-nya
+  			rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR,     W5500_S0_REG_OP) << 8) |
+  			                     W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
+  			if (rx_len > 0) {
+  				uint16_t grab = rx_len;
+  				if (body_in_chunk + grab > CHUNK_BUFFER_SIZE - 1) {
+  					grab = (CHUNK_BUFFER_SIZE - 1) - body_in_chunk;
+  				}
+  				s_off = rx_rd & W5500_S0_BUF_MASK;
+  				W5500_ReadBuf(s_off, W5500_S0_RX_OP, ram_buffer + body_in_chunk, grab);
+  				body_in_chunk += grab;
+  				ram_buffer[body_in_chunk] = '\0';
+
+  				rx_rd += rx_len;
+  				W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+  				W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+  				W5500_WriteReg(Sn_CR,        W5500_S0_REG_OP, CMD_RECV);
+  				while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+  			}
+
+  			// Sisipkan prefix "POST /config\r\n\r\n" agar lolos pengecekan strstr() di web_config.c
+  			const char prefix_tag[] = "POST /config\r\n\r\n";
+  			uint8_t tag_len = strlen(prefix_tag);
+  			if (body_in_chunk + tag_len < CHUNK_BUFFER_SIZE) {
+  				memmove(ram_buffer + tag_len, ram_buffer, body_in_chunk + 1);
+  				memcpy(ram_buffer, prefix_tag, tag_len);
+  				body_in_chunk += tag_len;
+  			}
+
+  			// Proses penyimpanan dan kirim response HTTP
+  			WebConfig_Handle(ram_buffer, body_in_chunk);
+
+  			// Berikan jeda sejenak agar frame TCP ACK / HTTP 200 OK selesai terkirim sebelum DISCON
+  			for (volatile int d = 0; d < 20000; d++);
+
+  			W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_DISCON);
+  			while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+  			return;
+  		}
+
+  		// Handle GET /config dan GET /config/data
+  		WebConfig_Handle(ram_buffer, fetch);
+
+  		rx_rd += rx_len;
+  		W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+  		W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+  		W5500_WriteReg(Sn_CR,        W5500_S0_REG_OP, CMD_RECV);
+  		while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+
+  		for (volatile int d = 0; d < 20000; d++);
+
+  		W5500_WriteReg(Sn_CR,        W5500_S0_REG_OP, CMD_DISCON);
+  		while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+  		return;
+  	}
+
+
+
+
   // GET / — Kirim halaman web
-  // ============================================================
   if (strstr((char *)ram_buffer, "GET /") != NULL) {
     char header[128];
     sprintf(header,
@@ -518,7 +571,6 @@ void Process_Web_OTA(void)
       strlen(HTML_PAGE));
     W5500_SendTCP((uint8_t *)header, strlen(header));
     W5500_SendTCP((const uint8_t *)HTML_PAGE, strlen(HTML_PAGE));
-
     rx_rd += rx_len;
     W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
     W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
@@ -529,15 +581,8 @@ void Process_Web_OTA(void)
     return;
   }
 
-  // ============================================================
   // POST /ota — Terima file binary
-  // ============================================================
   if (strstr((char *)ram_buffer, "POST /ota") == NULL) return;
-
-//  char *pSize = strstr((char *)ram_buffer, "?sz=");
-//  char *pCrc  = strstr((char *)ram_buffer, "&crc=");
-//  char *pBody = strstr((char *)ram_buffer, "\r\n\r\n");
-//  if (!pSize || !pCrc || !pBody) return;
 
   char *pSize = strstr((char *)ram_buffer, "?sz=");
   char *pCrc  = strstr((char *)ram_buffer, "&crc=");
@@ -551,41 +596,41 @@ void Process_Web_OTA(void)
   char *pBody = NULL;
 
   while (pBody == NULL) {
-      uint8_t overlap[4 + CHUNK_BUFFER_SIZE];
-      memcpy(overlap, tail, 4);
-      memcpy(overlap + 4, ram_buffer, fetch);
-      overlap[4 + fetch] = '\0';
+    uint8_t overlap[4 + CHUNK_BUFFER_SIZE];
+    memcpy(overlap, tail, 4);
+    memcpy(overlap + 4, ram_buffer, fetch);
+    overlap[4 + fetch] = '\0';
 
-      char *found = strstr((char *)overlap, "\r\n\r\n");
-      if (found) {
-          int pos_in_overlap = (found - (char *)overlap);
-          int pos_in_buf = pos_in_overlap - 4;
-          int body_start = pos_in_buf + 4;
-          if (body_start < 0) body_start = 0;
-          if (body_start > fetch) body_start = fetch;
-          pBody = (char *)ram_buffer + body_start;
+    char *found = strstr((char *)overlap, "\r\n\r\n");
+    if (found) {
+      int pos_in_overlap = (found - (char *)overlap);
+      int pos_in_buf     = pos_in_overlap - 4;
+      int body_start     = pos_in_buf + 4;
+      if (body_start < 0)     body_start = 0;
+      if (body_start > fetch) body_start = fetch;
+      pBody = (char *)ram_buffer + body_start;
 
-          rx_rd += fetch;
-          W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
-          W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
-          W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
-          while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
-          rx_already_updated = 1;
-      } else {
-          memcpy(tail, ram_buffer + fetch - 4, 4);
-          rx_rd += fetch;
-          W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
-          W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
-          W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
-          while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
-          rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR, W5500_S0_REG_OP) << 8) |
-                    W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
-          if (rx_len == 0) continue;
-          fetch = (rx_len > (CHUNK_BUFFER_SIZE - 1)) ? (CHUNK_BUFFER_SIZE - 1) : rx_len;
-          s_off = rx_rd & W5500_S0_BUF_MASK;
-          W5500_ReadBuf(s_off, W5500_S0_RX_OP, ram_buffer, fetch);
-          ram_buffer[fetch] = '\0';
-      }
+      rx_rd += fetch;
+      W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+      W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+      W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
+      while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+      rx_already_updated = 1;
+    } else {
+      memcpy(tail, ram_buffer + fetch - 4, 4);
+      rx_rd += fetch;
+      W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+      W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+      W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
+      while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+      rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR,     W5500_S0_REG_OP) << 8) |
+                           W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
+      if (rx_len == 0) continue;
+      fetch = (rx_len > (CHUNK_BUFFER_SIZE - 1)) ? (CHUNK_BUFFER_SIZE - 1) : rx_len;
+      s_off = rx_rd & W5500_S0_BUF_MASK;
+      W5500_ReadBuf(s_off, W5500_S0_RX_OP, ram_buffer, fetch);
+      ram_buffer[fetch] = '\0';
+    }
   }
 
   if (expected_size == 0 || expected_size > MAX_FIRMWARE_SIZE) {
@@ -596,7 +641,6 @@ void Process_Web_OTA(void)
     return;
   }
 
-  // Pilih target slot berdasarkan mode
 #ifdef OTA_MODE_BACKUP
   uint32_t target_meta = FLASH_BACKUP_META;
   uint32_t target_bin  = FLASH_BACKUP_BIN;
@@ -605,15 +649,12 @@ void Process_Web_OTA(void)
   uint32_t target_bin  = FLASH_STAGING_BIN;
 #endif
 
-  // Erase sektor target
   ExtFlash_EraseSector(target_meta);
   uint32_t sectors = (expected_size + 4095) / 4096;
-  for (uint32_t s = 0; s < sectors; s++) {
+  for (uint32_t s = 0; s < sectors; s++)
     ExtFlash_EraseSector(target_bin + (s * 4096));
-  }
 
-  // Tulis paket pertama
-  uint16_t header_len    = (uint8_t *)pBody - ram_buffer;
+  uint16_t header_len     = (uint8_t *)pBody - ram_buffer;
   uint16_t body_in_packet = fetch - header_len;
   uint32_t bytes_received = 0;
 
@@ -631,30 +672,21 @@ void Process_Web_OTA(void)
     bytes_received += body_in_packet;
   }
 
-  // Geser pointer RX
-//  rx_rd += fetch;
-//  W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
-//  W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
-//  W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
-//  while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
-
   if (!rx_already_updated) {
-      rx_rd += fetch;
-      W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
-      W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
-      W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
-      while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+    rx_rd += fetch;
+    W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+    W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+    W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
+    while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
   }
 
-  // Tarik sisa stream
-
-//  uint32_t ota_timeout = 0;
   while (bytes_received < expected_size) {
-	  rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR, W5500_S0_REG_OP) << 8) |	W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
-	  if (rx_len == 0) continue;
+    rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR,     W5500_S0_REG_OP) << 8) |
+                         W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
+    if (rx_len == 0) continue;
 
-	  rx_rd = ((uint16_t)W5500_ReadReg(Sn_RX_RD, W5500_S0_REG_OP) << 8) |	W5500_ReadReg(Sn_RX_RD + 1, W5500_S0_REG_OP);
-
+    rx_rd = ((uint16_t)W5500_ReadReg(Sn_RX_RD,     W5500_S0_REG_OP) << 8) |
+                        W5500_ReadReg(Sn_RX_RD + 1, W5500_S0_REG_OP);
 
     uint16_t grab = (rx_len > CHUNK_BUFFER_SIZE) ? CHUNK_BUFFER_SIZE : rx_len;
     if (bytes_received + grab > expected_size) grab = expected_size - bytes_received;
@@ -683,11 +715,10 @@ void Process_Web_OTA(void)
     rx_rd          += grab;
     W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
     W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
-    W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_RECV);
+    W5500_WriteReg(Sn_CR,        W5500_S0_REG_OP, CMD_RECV);
     while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
   }
 
-  // Verifikasi CRC dari target slot
   CRC->CR = 1;
   uint32_t words  = (expected_size + 3) / 4;
   uint32_t r_addr = target_bin;
@@ -702,7 +733,6 @@ void Process_Web_OTA(void)
   }
 
   if (CRC->DR == expected_crc) {
-    // Tulis metadata ke target slot
     uint8_t meta[10] = {0};
     meta[0] = (uint8_t)(expected_size);
     meta[1] = (uint8_t)(expected_size >> 8);
@@ -714,10 +744,8 @@ void Process_Web_OTA(void)
     meta[7] = (uint8_t)(expected_crc >> 24);
 
 #ifdef OTA_MODE_BACKUP
-    meta[8] = 0x00; // Backup: flag idle/valid
+    meta[8] = 0x00;
     ExtFlash_WritePage(target_meta, meta, 10);
-
-    // Kirim response OK, TIDAK reset
     const char ok_body[] = "Backup Saved!";
     char ok_msg[80];
     sprintf(ok_msg,
@@ -726,20 +754,15 @@ void Process_Web_OTA(void)
     W5500_SendTCP((uint8_t *)ok_msg, strlen(ok_msg));
     W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_DISCON);
     while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
-
 #else
-    meta[8] = 0xA5; // Staging: flag ada firmware baru
+    meta[8] = 0xA5;
     ExtFlash_WritePage(target_meta, meta, 10);
-
-    // Kirim response OK, lalu reset
-//    const char ok_body[] = "OK";
     const char ok_body[] = "Update Terkirim! Firmware tersimpan di flash. Device Rebooting...";
-    char ok_msg[64];
+    char ok_msg[128];
     sprintf(ok_msg,
       "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
       strlen(ok_body), ok_body);
     W5500_SendTCP((uint8_t *)ok_msg, strlen(ok_msg));
-
     for (volatile int d = 0; d < 7200000; d++);
     NVIC_SystemReset();
 #endif
@@ -751,6 +774,8 @@ void Process_Web_OTA(void)
     while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
   }
 }
+
+uint32_t g_html_ota_size    = 0;
 /* USER CODE END 0 */
 
 /**
@@ -761,8 +786,8 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-	SCB->VTOR = APP_START_ADDR;
-	__enable_irq();
+  SCB->VTOR = APP_START_ADDR;
+  __enable_irq();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -789,9 +814,8 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+  // Enable SysTick interrupt (LL_Init1msTick tidak set TICKINT otomatis)
   SysTick->CTRL |= SysTick_CTRL_TICKINT_Msk;
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -799,32 +823,26 @@ int main(void)
   MX_SPI1_Init();
   MX_SPI2_Init();
   MX_CRC_Init();
-//  MX_IWDG_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
   LL_SPI_Enable(SPI1);
-  if (LL_SPI_IsActiveFlag_RXNE(SPI1)) {
-      (void)LL_SPI_ReceiveData8(SPI1);
-  }
-  if (SPI1->SR & SPI_SR_OVR) {
-      (void)SPI1->DR;
-      (void)SPI1->SR;
-  }
+  if (LL_SPI_IsActiveFlag_RXNE(SPI1)) (void)LL_SPI_ReceiveData8(SPI1);
+  if (SPI1->SR & SPI_SR_OVR) { (void)SPI1->DR; (void)SPI1->SR; }
   LL_SPI_Enable(SPI2);
-//  uint8_t backup_flag = 0xFF;
-//  Flash_ReadBytes(FLASH_BACKUP_META + 8, &backup_flag, 1);
-//
-//  // Jika belum pernah di-backup (flag bukan 0x00), lakukan backup sekarang
-//  if (backup_flag != 0x00)
-//  {
-//	  Backup_CurrentFirmwareToExtFlash(8176);
-//  }
-  uint8_t dbg_flag = 0xFF;
-  Flash_ReadBytes(FLASH_STAGING_META + 8, &dbg_flag, 1);
 
   W5500_InitNetwork();
   DHCP_Init();
+  WebConfig_Init();
+  MQTT_Init();
+
+  g_dbg_s2_sr     = W5500_ReadReg(0x0003, 0x48);
+  g_dbg_s2_fsr_hi = W5500_ReadReg(0x0020, 0x48);
+  g_dbg_s2_fsr_lo = W5500_ReadReg(0x0021, 0x48);
+
   g_phy_reg = W5500_ReadReg(0x002E, 0x00);
 
+#ifdef MAIN_DEBUG
+  // Test write/read Socket 0
   W5500_WriteReg(0x0004, W5500_S0_REG_OP, 0xAB);
   g_dbg_s0_test = W5500_ReadReg(0x0004, W5500_S0_REG_OP);
 
@@ -832,13 +850,18 @@ int main(void)
   W5500_WriteReg(0x0004, 0x28, 0xCD);
   g_dbg_s1_test = W5500_ReadReg(0x0004, 0x28);
 
-  W5500_WriteReg(0x0004, 0x28, 0xAB);  // PORT high → berhasil
-  W5500_WriteReg(0x0005, 0x28, 0xCD);  // PORT low
-  W5500_WriteReg(0x0006, 0x28, 0xFF);  // DHAR[0]
-  W5500_WriteReg(0x0007, 0x28, 0xFF);  // DHAR[1]
-
-  g_dbg_test2 = W5500_ReadReg(0x0006, 0x28);  // harus 0xFF
+  // Test write/read DHAR Socket 1
+  W5500_WriteReg(0x0006, 0x28, 0xFF);
+  W5500_WriteReg(0x0007, 0x28, 0xFF);
+  g_dbg_test2 = W5500_ReadReg(0x0006, 0x28);
   g_dbg_test3 = W5500_ReadReg(0x0007, 0x28);
+#endif
+
+#ifdef DEBUG_MQTT
+  W5500_WriteReg(0x001E, 0x48, 2);
+  W5500_WriteReg(0x001F, 0x48, 2);
+  g_dbg_s2_tx_size = W5500_ReadReg(0x001E, 0x48);
+#endif
 
   uint32_t led_tick = 0;
   /* USER CODE END 2 */
@@ -850,21 +873,31 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-//	  Process_Web_OTA();
-	  DHCP_Process();           // Proses DHCP setiap loop
+    DHCP_Process();
 
-	        // Jalankan web OTA hanya kalau sudah dapat IP
-	  if (DHCP_IsBound())
-	  {
-		  Process_Web_OTA();
-	  }
-//	  LL_IWDG_ReloadCounter(IWDG);
+    if (DHCP_IsBound())
+    {
+      Process_Web_OTA();
+      static MqttConfig_t s_mqtt_cfg;
+      static uint8_t s_cfg_loaded = 0;
+      if (!s_cfg_loaded)
+      {
+    	  MqttConfig_Load(&s_mqtt_cfg);
+          s_cfg_loaded = 1;
+      }
+      MQTT_Process(&s_mqtt_cfg);
+    }
 
-	  if (++led_tick > 100000)
-	  {
-		  LL_GPIO_TogglePin(LED_BUILTIN_GPIO_Port, LED_BUILTIN_Pin);
-		  led_tick = 0;
-	  }
+    LL_IWDG_ReloadCounter(IWDG);
+
+
+    g_html_ota_size    = sizeof(HTML_PAGE);
+
+    if (++led_tick > 100000)
+    {
+      LL_GPIO_TogglePin(LED_BUILTIN_GPIO_Port, LED_BUILTIN_Pin);
+      led_tick = 0;
+    }
   }
   /* USER CODE END 3 */
 }
@@ -884,14 +917,12 @@ void SystemClock_Config(void)
    /* Wait till HSE is ready */
   while(LL_RCC_HSE_IsReady() != 1)
   {
-
   }
   LL_RCC_LSI_Enable();
 
    /* Wait till LSI is ready */
   while(LL_RCC_LSI_IsReady() != 1)
   {
-
   }
   LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_1, LL_RCC_PLL_MUL_9);
   LL_RCC_PLL_Enable();
@@ -899,7 +930,6 @@ void SystemClock_Config(void)
    /* Wait till PLL is ready */
   while(LL_RCC_PLL_IsReady() != 1)
   {
-
   }
   LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
   LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_2);
@@ -909,7 +939,6 @@ void SystemClock_Config(void)
    /* Wait till System clock is ready */
   while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL)
   {
-
   }
   LL_Init1msTick(72000000);
   LL_SetSystemCoreClock(72000000);
@@ -961,7 +990,6 @@ static void MX_IWDG_Init(void)
   while (LL_IWDG_IsReady(IWDG) != 1)
   {
   }
-
   LL_IWDG_ReloadCounter(IWDG);
   /* USER CODE BEGIN IWDG_Init 2 */
 
@@ -1151,7 +1179,6 @@ static void MX_GPIO_Init(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
