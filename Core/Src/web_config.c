@@ -9,6 +9,7 @@
 // FORWARD DECLARATION
 // =============================================================================
 extern void W5500_SendTCP(const uint8_t *data, uint16_t len);
+uint8_t g_config_updated = 0;
 
 // =============================================================================
 // HTML — persis Tasmota MQTT Config page
@@ -232,7 +233,7 @@ static void parse_field(const char *body, const char *key,
     size_t len = end ? (size_t)(end - p) : strlen(p);
     if (len >= out_len) len = out_len - 1;
 
-    char tmp[200];
+    static char tmp[200];
     if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
     memcpy(tmp, p, len);
     tmp[len] = '\0';
@@ -407,6 +408,7 @@ void WebConfig_Handle(uint8_t *rx_buf, uint16_t rx_len)
 
         int err = MqttConfig_Save(&cfg);
         if (err == 0) {
+            g_config_updated = 1;
             send_response(200, "OK", "Config tersimpan!");
         } else {
             send_response(500, "Error", "Gagal simpan ke flash");

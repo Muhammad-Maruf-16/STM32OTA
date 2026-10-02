@@ -74,13 +74,20 @@ extern volatile uint32_t g_ms_tick;
 // =============================================================================
 // VARIABEL GLOBAL
 // =============================================================================
-uint8_t  g_dhcp_ip[4]  = {0};
-uint8_t  g_dhcp_gw[4]  = {0};
-uint8_t  g_dhcp_sub[4] = {0};
-uint8_t  g_dhcp_dns[4] = {0};
-uint32_t g_dhcp_lease  = 0;
-uint8_t  g_dhcp_state  = DHCP_STATE_IDLE;
-uint8_t  g_link_status = 0;
+//uint8_t  g_dhcp_ip[4]  = {0};
+//uint8_t  g_dhcp_gw[4]  = {0};
+//uint8_t  g_dhcp_sub[4] = {0};
+//uint8_t  g_dhcp_dns[4] = {0};
+//uint32_t g_dhcp_lease  = 0;
+//uint8_t  g_dhcp_state  = DHCP_STATE_IDLE;
+//uint8_t  g_link_status = 0;
+uint8_t  g_dhcp_ip[4];
+uint8_t  g_dhcp_gw[4];
+uint8_t  g_dhcp_sub[4];
+uint8_t  g_dhcp_dns[4];
+uint32_t g_dhcp_lease;
+uint8_t  g_dhcp_state;
+uint8_t  g_link_status;
 
 // =============================================================================
 // VARIABEL DEBUG
@@ -412,6 +419,13 @@ static void dhcp_reset(void)
 // =============================================================================
 void DHCP_Init(void)
 {
+	memset(g_dhcp_ip,  0, 4);
+	    memset(g_dhcp_gw,  0, 4);
+	    memset(g_dhcp_sub, 0, 4);
+	    memset(g_dhcp_dns, 0, 4);
+	    g_dhcp_lease = 0;
+	    g_dhcp_state = DHCP_STATE_IDLE;
+	    g_link_status = 0;
     dhcp_reset();
     g_link_status = is_link_up();
 }

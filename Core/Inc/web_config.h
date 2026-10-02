@@ -6,7 +6,7 @@
 // =============================================================================
 // FUNGSI PUBLIK
 // =============================================================================
-
+extern uint8_t g_config_updated;
 /**
  * @brief  Inisialisasi web config — load config MQTT ke memory saat boot.
  *         Dipanggil sekali di USER CODE BEGIN 2.
