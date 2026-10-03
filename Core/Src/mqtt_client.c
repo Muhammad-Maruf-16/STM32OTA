@@ -391,7 +391,7 @@ static void publish_sensor(void)
         "\"Time\":\"%s\","
         "\"Switch1\":\"%s\","
         "\"ENERGY\":{"
-            "\"Voltage\":%.1f,"
+            "\"Voltage\":%d.%d,"
             "\"Current\":0.000,"
             "\"Power\":0"
         "},"
@@ -401,7 +401,9 @@ static void publish_sensor(void)
         "}",
         s_time,
         g_can_b_data.relay_state ? "ON" : "OFF",
-        g_can_b_data.voltage / 10.0f,
+
+g_can_b_data.voltage / 10,
+g_can_b_data.voltage % 10,
         g_can_b_data.temperature,
         g_can_b_data.uptime,
         g_can_b_data.counter);
@@ -574,14 +576,15 @@ static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
             snprintf(s_json, sizeof(s_json),
                    "{\"StatusSNS\":{\"Time\":\"%s\","
                    "\"Switch1\":\"%s\","
-                   "\"ENERGY\":{\"Voltage\":%.1f,"
+                   "\"ENERGY\":{\"Voltage\":%d.%d,"
                    "\"Current\":0.000,\"Power\":0,\"Total\":0.000},"
                    "\"Temperature\":%d,"
                    "\"Uptime\":%d,"
                    "\"Counter\":%d}}",
                    s_time,
                    g_can_b_data.relay_state ? "ON" : "OFF",
-                   g_can_b_data.voltage / 10.0f,
+                	g_can_b_data.voltage / 10,
+					g_can_b_data.voltage % 10,
                    g_can_b_data.temperature,
                    g_can_b_data.uptime,
                    g_can_b_data.counter);
