@@ -52,21 +52,11 @@ extern volatile uint32_t g_ms_tick;
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
-{
-    CAN_Bus_RxFifo0Callback(hcan);
-}
-
-void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
-{
-    CAN_Bus_RxFifo1Callback(hcan);
-}
-
-
+// HAL CAN callback tidak dipakai — CAN sudah bare-metal
+// IRQ handler langsung panggil fungsi can_bus
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-extern CAN_HandleTypeDef hcan;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -214,13 +204,7 @@ void SysTick_Handler(void)
   */
 void USB_HP_CAN1_TX_IRQHandler(void)
 {
-  /* USER CODE BEGIN USB_HP_CAN1_TX_IRQn 0 */
-
-  /* USER CODE END USB_HP_CAN1_TX_IRQn 0 */
-  HAL_CAN_IRQHandler(&hcan);
-  /* USER CODE BEGIN USB_HP_CAN1_TX_IRQn 1 */
-
-  /* USER CODE END USB_HP_CAN1_TX_IRQn 1 */
+  // TX interrupt — tidak perlu aksi, mailbox otomatis bebas setelah TX selesai
 }
 
 /**
@@ -229,12 +213,8 @@ void USB_HP_CAN1_TX_IRQHandler(void)
 void USB_LP_CAN1_RX0_IRQHandler(void)
 {
   /* USER CODE BEGIN USB_LP_CAN1_RX0_IRQn 0 */
-
+  CAN_Bus_RxFifo0Callback();
   /* USER CODE END USB_LP_CAN1_RX0_IRQn 0 */
-  HAL_CAN_IRQHandler(&hcan);
-  /* USER CODE BEGIN USB_LP_CAN1_RX0_IRQn 1 */
-
-  /* USER CODE END USB_LP_CAN1_RX0_IRQn 1 */
 }
 
 /**
@@ -243,26 +223,20 @@ void USB_LP_CAN1_RX0_IRQHandler(void)
 void CAN1_RX1_IRQHandler(void)
 {
   /* USER CODE BEGIN CAN1_RX1_IRQn 0 */
-
+  CAN_Bus_RxFifo1Callback();
   /* USER CODE END CAN1_RX1_IRQn 0 */
-  HAL_CAN_IRQHandler(&hcan);
-  /* USER CODE BEGIN CAN1_RX1_IRQn 1 */
-
-  /* USER CODE END CAN1_RX1_IRQn 1 */
 }
 
 /**
-  * @brief This function handles CAN SCE interrupt.
+  * @brief This function handles CAN SCE interrupt (error/busoff).
   */
 void CAN1_SCE_IRQHandler(void)
 {
   /* USER CODE BEGIN CAN1_SCE_IRQn 0 */
-
+  // Clear error flags
+  CAN1->MSR &= ~CAN_MSR_ERRI;
+  CAN1->ESR  = 0U;
   /* USER CODE END CAN1_SCE_IRQn 0 */
-  HAL_CAN_IRQHandler(&hcan);
-  /* USER CODE BEGIN CAN1_SCE_IRQn 1 */
-
-  /* USER CODE END CAN1_SCE_IRQn 1 */
 }
 
 /* USER CODE BEGIN 1 */

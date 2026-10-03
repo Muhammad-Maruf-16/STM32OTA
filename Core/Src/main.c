@@ -1556,7 +1556,7 @@ int main(void)
   DHCP_Init();
   WebConfig_Init();
   MQTT_Init();
-  CAN_Bus_Init(&hcan);
+  CAN_Bus_Init();
 
 
 #ifdef MAIN_DEBUG
@@ -1600,7 +1600,7 @@ int main(void)
 	  static uint32_t last_test = 0;
 	  if ((HAL_GetTick() - last_test) >= 1000) {
 	      last_test = HAL_GetTick();
-	      CAN_Bus_SendCmd(&hcan, RELAY_CMD_STATUS_REQ);
+	      CAN_Bus_SendCmd(RELAY_CMD_STATUS_REQ);
 
 	      LL_GPIO_TogglePin(LED_BUILTIN_GPIO_Port, LED_BUILTIN_Pin);
 	  }

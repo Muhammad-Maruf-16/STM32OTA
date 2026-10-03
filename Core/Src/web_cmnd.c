@@ -10,12 +10,11 @@
 // FORWARD DECLARATION
 // =============================================================================
 extern void W5500_SendTCP(const uint8_t *data, uint16_t len);
-extern CAN_HandleTypeDef hcan;
 
 // HTML_CMND_PAGE dihapus — halaman di-serve dari SPI Flash via HtmlFlash_SendPage()
 
 // =============================================================================
-// HELPER: URL decode (sama persis dengan web_config.c)
+// HELPER: URL decode
 // =============================================================================
 static void url_decode(char *dst, const char *src, size_t max_len)
 {
@@ -85,11 +84,9 @@ static void send_html_page(void)
 
 // =============================================================================
 // HELPER: Hex string → byte array
-// Contoh: "0102FF" → {0x01, 0x02, 0xFF}, return DLC (jumlah byte)
 // =============================================================================
 static uint8_t hex_str_to_bytes(const char *str, uint8_t *out, uint8_t max_bytes)
 {
-    /* Bersihkan spasi, ambil maks 16 char */
     char clean[17] = {0};
     uint8_t ci = 0;
     for (uint8_t i = 0; str[i] && ci < 16; i++) {
@@ -97,13 +94,7 @@ static uint8_t hex_str_to_bytes(const char *str, uint8_t *out, uint8_t max_bytes
         if (c == ' ' || c == '\t') continue;
         clean[ci++] = c;
     }
-
-    /* Jika ganjil: ABAIKAN karakter TERAKHIR (bukan pad depan)
-       Misal "1233218" → "123321" → 12 33 21
-       Konsisten: karakter yang belum punya pasangan dibuang */
-    if (ci % 2 != 0) {
-        ci--;  /* buang karakter terakhir */
-    }
+    if (ci % 2 != 0) ci--;
 
     uint8_t dlc = 0;
     for (uint8_t i = 0; i < ci && dlc < max_bytes; i += 2) {
@@ -113,10 +104,10 @@ static uint8_t hex_str_to_bytes(const char *str, uint8_t *out, uint8_t max_bytes
     }
     return dlc;
 }
+
 // =============================================================================
 // FUNGSI PUBLIK
 // =============================================================================
-
 void WebCmnd_Handle(uint8_t *rx_buf, uint16_t rx_len)
 {
     (void)rx_len;
@@ -131,7 +122,7 @@ void WebCmnd_Handle(uint8_t *rx_buf, uint16_t rx_len)
     }
 
     // =========================================================
-    // POST /cmnd → parse id + msg, kirim CAN
+    // POST /cmnd → parse id + msg, kirim CAN bare-metal
     // =========================================================
     if (strstr(req, "POST /cmnd") != NULL) {
         char *body = strstr(req, "\r\n\r\n");
@@ -152,10 +143,8 @@ void WebCmnd_Handle(uint8_t *rx_buf, uint16_t rx_len)
             return;
         }
 
-        /* Parse CAN ID */
         uint32_t can_id = strtoul(s_id, NULL, 16);
 
-        /* Parse MSG bytes */
         uint8_t data[8] = {0};
         uint8_t dlc = hex_str_to_bytes(s_msg, data, 8);
 
@@ -164,31 +153,33 @@ void WebCmnd_Handle(uint8_t *rx_buf, uint16_t rx_len)
             return;
         }
 
-        /* Kirim via CAN */
-        CAN_TxHeaderTypeDef tx_hdr;
-        memset(&tx_hdr, 0, sizeof(tx_hdr));
+        // Cari TX mailbox kosong
+        uint8_t mb = 0xFF;
+        if      (CAN1->TSR & CAN_TSR_TME0) mb = 0;
+        else if (CAN1->TSR & CAN_TSR_TME1) mb = 1;
+        else if (CAN1->TSR & CAN_TSR_TME2) mb = 2;
 
-        /* Tentukan Standard / Extended berdasarkan nilai ID */
-        if (can_id <= 0x7FF) {
-            tx_hdr.IDE   = CAN_ID_STD;
-            tx_hdr.StdId = can_id;
-        } else {
-            tx_hdr.IDE   = CAN_ID_EXT;
-            tx_hdr.ExtId = can_id;
+        if (mb == 0xFF) {
+            send_response(500, "Error", "Semua TX mailbox penuh");
+            return;
         }
-        tx_hdr.RTR = CAN_RTR_DATA;
-        tx_hdr.DLC = dlc;
 
-        uint32_t tx_mailbox;
-        HAL_StatusTypeDef status = HAL_CAN_AddTxMessage(&hcan, &tx_hdr, data, &tx_mailbox);
+        // Set TIR — Standard atau Extended ID
+        if (can_id <= 0x7FFU)
+            CAN1->sTxMailBox[mb].TIR = (can_id << 21);
+        else
+            CAN1->sTxMailBox[mb].TIR = ((can_id << 3) & CAN_TI0R_EXID) | CAN_TI0R_IDE;
 
-        if (status == HAL_OK) {
-            char resp[64];
-            snprintf(resp, sizeof(resp), "OK ID=0x%lX DLC=%u", can_id, dlc);
-            send_response(200, "OK", resp);
-        } else {
-            send_response(500, "Error", "HAL_CAN_AddTxMessage gagal");
-        }
+        CAN1->sTxMailBox[mb].TDTR = dlc;
+        CAN1->sTxMailBox[mb].TDLR = ((uint32_t)data[0])       | ((uint32_t)data[1] << 8)
+                                   | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+        CAN1->sTxMailBox[mb].TDHR = ((uint32_t)data[4])       | ((uint32_t)data[5] << 8)
+                                   | ((uint32_t)data[6] << 16) | ((uint32_t)data[7] << 24);
+        CAN1->sTxMailBox[mb].TIR |= CAN_TI0R_TXRQ;
+
+        char resp[64];
+        snprintf(resp, sizeof(resp), "OK ID=0x%lX DLC=%u", (unsigned long)can_id, dlc);
+        send_response(200, "OK", resp);
         return;
     }
 }

@@ -19,7 +19,6 @@ extern volatile uint32_t g_ms_tick;
 extern CanBoardBData_t g_can_b_data;
 extern uint32_t        g_can_tx_count;
 extern uint32_t        g_can_rx_count;
-extern CAN_HandleTypeDef hcan;
 
 // IP yang didapat DHCP
 extern uint8_t g_dhcp_ip[4];
@@ -73,10 +72,6 @@ extern uint8_t g_dhcp_ip[4];
 // =============================================================================
 // VARIABEL GLOBAL
 // =============================================================================
-//MqttState_t     g_mqtt_state     = MQTT_STATE_IDLE;
-//uint8_t         g_mqtt_conn_count = 0;
-//uint32_t        g_mqtt_pub_count  = 0;
-
 MqttState_t     g_mqtt_state;
 uint8_t         g_mqtt_conn_count;
 uint32_t        g_mqtt_pub_count;
@@ -88,12 +83,12 @@ MqttSensorData_t g_mqtt_sensor   = {25.0f, 3.30f};
 // =============================================================================
 static uint8_t  s_buf[MQTT_BUF_SIZE];
 static uint16_t s_pkt_id   = 1;
-static uint32_t s_tick_ref = 0;     // referensi waktu untuk timeout/interval
-static uint32_t s_last_ping = 0;    // waktu terakhir PINGREQ
-static uint32_t s_uptime_sec = 0;   // uptime counter
-static uint32_t s_last_uptime = 0;  // untuk hitung uptime
-static uint32_t s_pub_interval = 0; // interval publish dari config (ms)
-static uint32_t s_last_pub = 0;     // waktu terakhir publish tele
+static uint32_t s_tick_ref = 0;
+static uint32_t s_last_ping = 0;
+static uint32_t s_uptime_sec = 0;
+static uint32_t s_last_uptime = 0;
+static uint32_t s_pub_interval = 0;
+static uint32_t s_last_pub = 0;
 static uint32_t s_startup_tick = 0;
 
 // topic cache
@@ -104,20 +99,17 @@ static char s_t_result[96];
 static char s_t_power[96];
 static char s_t_cmnd[96];
 
-// Flag untuk publish startup (dikirim satu per satu di state machine)
 static uint8_t s_startup_step = 0;
 
-// Status command queue — untuk handle cmnd/Status=0 (kirim semua STATUS)
-static int8_t  s_status_cmd   = -1;  // -1=idle, 0=kirim semua, 1-11=kirim status N
-static uint8_t s_status_step  = 0;   // step untuk STATUS0 (kirim 1 per loop)
+static int8_t  s_status_cmd   = -1;
+static uint8_t s_status_step  = 0;
 
 // =============================================================================
-// SHARED STATIC BUFFER — hindari stack overflow
-// Semua fungsi pakai buffer yang sama secara bergantian (tidak reentrant)
+// SHARED STATIC BUFFER
 // =============================================================================
-static char     s_json[400];   // buffer JSON publish
-static char     s_time[24];    // buffer timestamp
-static char     s_uptime[16];  // buffer uptime string
+static char     s_json[400];
+static char     s_time[24];
+static char     s_uptime[16];
 
 // =============================================================================
 // HELPER: Tunggu CR clear Socket 2
@@ -135,17 +127,15 @@ static void s2_wait_cr(uint32_t timeout_ms)
 // =============================================================================
 static void s2_send(const uint8_t *data, uint16_t len)
 {
-    // Cek socket established
     uint8_t sr = W5500_ReadReg(Sn_SR, S2_REG_OP);
     if (sr != SOCK_ESTABLISHED) return;
 
-    // Cek TX Free Size cukup
     uint32_t t = g_ms_tick;
     uint16_t fsr;
     do {
         fsr = ((uint16_t)W5500_ReadReg(Sn_TX_FSR,     S2_REG_OP) << 8) |
                           W5500_ReadReg(Sn_TX_FSR + 1, S2_REG_OP);
-        if ((g_ms_tick - t) > 200) return;  // timeout 200ms
+        if ((g_ms_tick - t) > 200) return;
     } while (fsr < len);
 
     uint16_t ptr = ((uint16_t)W5500_ReadReg(Sn_TX_WR,     S2_REG_OP) << 8) |
@@ -159,7 +149,7 @@ static void s2_send(const uint8_t *data, uint16_t len)
 }
 
 // =============================================================================
-// HELPER: Encode MQTT remaining length (variable length encoding)
+// HELPER: Encode MQTT remaining length
 // =============================================================================
 static uint8_t encode_remaining(uint8_t *buf, uint32_t len)
 {
@@ -186,7 +176,7 @@ static uint16_t write_str(uint8_t *buf, const char *str)
 }
 
 // =============================================================================
-// HELPER: Format waktu uptime "0T00:05:23"
+// HELPER: Format uptime "0T00:05:23"
 // =============================================================================
 static void format_uptime(char *out, uint32_t sec)
 {
@@ -202,12 +192,10 @@ static void format_uptime(char *out, uint32_t sec)
 }
 
 // =============================================================================
-// HELPER: Format timestamp dummy "2026-09-30T13:35:00"
-// (tanpa RTC — pakai uptime saja sebagai placeholder)
+// HELPER: Format timestamp dummy
 // =============================================================================
 static void format_time(char *out)
 {
-    // Placeholder — nanti bisa diganti dengan RTC
     uint32_t s   = s_uptime_sec;
     uint32_t hh  = (s / 3600) % 24;
     uint32_t mm  = (s / 60) % 60;
@@ -223,51 +211,36 @@ static void format_time(char *out)
 // =============================================================================
 static void mqtt_send_connect(const MqttConfig_t *cfg)
 {
-    // Gunakan bagian kedua s_buf sebagai payload buffer (s_buf = 512 bytes)
-    uint8_t  *payload = &s_buf[100];  // offset 100, max 300 bytes
+    uint8_t  *payload = &s_buf[100];
     uint16_t pi = 0;
 
-    // --- Variable header ---
-    // Protocol Name "MQTT"
     payload[pi++] = 0x00;
     payload[pi++] = 0x04;
     payload[pi++] = 'M';
     payload[pi++] = 'Q';
     payload[pi++] = 'T';
     payload[pi++] = 'T';
-
-    // Protocol Level 3.1.1
     payload[pi++] = 0x04;
 
-    // Connect Flags
-    uint8_t flags = 0x02;           // Clean Session
-    flags |= 0x04;                  // Will Flag
-    flags |= 0x20;                  // Will Retain, Will QoS=0
-    if (cfg->user[0])     flags |= 0x80;  // Username
-    if (cfg->password[0]) flags |= 0x40;  // Password
+    uint8_t flags = 0x02;
+    flags |= 0x04;
+    flags |= 0x20;
+    if (cfg->user[0])     flags |= 0x80;
+    if (cfg->password[0]) flags |= 0x40;
     payload[pi++] = flags;
 
-    // Keepalive
     payload[pi++] = (uint8_t)(MQTT_KEEPALIVE_SEC >> 8);
     payload[pi++] = (uint8_t)(MQTT_KEEPALIVE_SEC);
 
-    // --- Payload ---
-    // Client ID
     pi += write_str(&payload[pi], cfg->client_id);
-
-    // Will Topic + Will Message (LWT)
     pi += write_str(&payload[pi], s_t_lwt);
     pi += write_str(&payload[pi], "Offline");
 
-    // Username (jika ada)
     if (cfg->user[0])
         pi += write_str(&payload[pi], cfg->user);
-
-    // Password (jika ada)
     if (cfg->password[0])
         pi += write_str(&payload[pi], cfg->password);
 
-    // --- Fixed header ---
     uint8_t rem[4];
     uint8_t rem_len = encode_remaining(rem, pi);
 
@@ -285,13 +258,13 @@ static void mqtt_send_connect(const MqttConfig_t *cfg)
 void MQTT_Publish(const char *topic, const uint8_t *payload, uint16_t plen)
 {
     uint16_t topic_len = (uint16_t)strlen(topic);
-    uint32_t rem = 2 + topic_len + plen;  // 2 = topic length field
+    uint32_t rem = 2 + topic_len + plen;
 
     uint8_t rem_enc[4];
     uint8_t rem_len = encode_remaining(rem_enc, rem);
 
     uint16_t i = 0;
-    s_buf[i++] = MQTT_PUBLISH;  // QoS 0, no retain
+    s_buf[i++] = MQTT_PUBLISH;
     memcpy(&s_buf[i], rem_enc, rem_len); i += rem_len;
     s_buf[i++] = (uint8_t)(topic_len >> 8);
     s_buf[i++] = (uint8_t)(topic_len);
@@ -308,7 +281,7 @@ void MQTT_Publish(const char *topic, const uint8_t *payload, uint16_t plen)
 static void mqtt_subscribe(const char *topic)
 {
     uint16_t topic_len = (uint16_t)strlen(topic);
-    uint32_t rem = 2 + 2 + topic_len + 1;  // pkt_id + topic_len + topic + QoS
+    uint32_t rem = 2 + 2 + topic_len + 1;
 
     uint8_t rem_enc[4];
     uint8_t rem_len = encode_remaining(rem_enc, rem);
@@ -321,7 +294,7 @@ static void mqtt_subscribe(const char *topic)
     s_buf[i++] = (uint8_t)(topic_len >> 8);
     s_buf[i++] = (uint8_t)(topic_len);
     memcpy(&s_buf[i], topic, topic_len); i += topic_len;
-    s_buf[i++] = 0x00;  // QoS 0
+    s_buf[i++] = 0x00;
 
     s2_send(s_buf, i);
 }
@@ -336,7 +309,9 @@ static void mqtt_pingreq(void)
     s2_send(s_buf, 2);
 }
 
-// mqtt_client.c — fungsi baru untuk publish dengan retain flag
+// =============================================================================
+// MQTT PUBLISH with retain flag
+// =============================================================================
 static void mqtt_publish_retain(const char *topic, const uint8_t *payload, uint16_t plen)
 {
     uint16_t topic_len = (uint16_t)strlen(topic);
@@ -358,11 +333,10 @@ static void mqtt_publish_retain(const char *topic, const uint8_t *payload, uint1
 }
 
 // =============================================================================
-// PUBLISH tele/STATE — mirip Tasmota Sonoff single relay
+// PUBLISH tele/STATE
 // =============================================================================
 static void publish_state(const MqttConfig_t *cfg)
 {
-    // Pakai static buffer — hindari stack overflow
     format_uptime(s_uptime, s_uptime_sec);
     format_time(s_time);
 
@@ -389,20 +363,17 @@ static void publish_state(const MqttConfig_t *cfg)
         "\"Hostname\":\"%s\","
         "\"IPAddress\":\"%s\""
         "}",
-        s_time,
-        s_uptime,
+        s_time, s_uptime,
         (unsigned long)s_uptime_sec,
         g_mqtt_conn_count,
         g_can_b_data.relay_state ? "ON" : "OFF",
-        ip_str,
-        cfg->client_id,
-        ip_str);
+        ip_str, cfg->client_id, ip_str);
 
     MQTT_Publish(s_t_state, (uint8_t *)s_json, (uint16_t)strlen(s_json));
 }
 
 // =============================================================================
-// PUBLISH tele/SENSOR — data sensor (dummy, forward variabel g_mqtt_sensor)
+// PUBLISH tele/SENSOR
 // =============================================================================
 static void publish_sensor(void)
 {
@@ -423,9 +394,8 @@ static void publish_sensor(void)
         "}",
         s_time,
         g_can_b_data.relay_state ? "ON" : "OFF",
-
-g_can_b_data.voltage / 10,
-g_can_b_data.voltage % 10,
+        g_can_b_data.voltage / 10,
+        g_can_b_data.voltage % 10,
         g_can_b_data.temperature,
         g_can_b_data.uptime,
         g_can_b_data.counter);
@@ -434,7 +404,7 @@ g_can_b_data.voltage % 10,
 }
 
 // =============================================================================
-// PUBLISH tele/INFO1, INFO2, INFO3 — dikirim sekali saat connect
+// PUBLISH tele/INFO1, INFO2, INFO3
 // =============================================================================
 static char s_info_topic[96];
 
@@ -444,11 +414,9 @@ static void publish_info(const MqttConfig_t *cfg)
     snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
              g_dhcp_ip[0], g_dhcp_ip[1], g_dhcp_ip[2], g_dhcp_ip[3]);
 
-    // Bangun base topic "tele/topic/" ke s_info_topic dulu
     char tele_base[96];
     MqttConfig_BuildTopic(cfg, "tele", tele_base, sizeof(tele_base));
 
-    // INFO1
     snprintf(s_info_topic, sizeof(s_info_topic), "%sINFO1", tele_base);
     snprintf(s_json, sizeof(s_json),
         "{\"Info1\":{\"Module\":\"STM32F103+W5500\",\"Version\":\"1.0.0\","
@@ -456,7 +424,6 @@ static void publish_info(const MqttConfig_t *cfg)
         cfg->topic);
     MQTT_Publish(s_info_topic, (uint8_t *)s_json, (uint16_t)strlen(s_json));
 
-    // INFO2
     snprintf(s_info_topic, sizeof(s_info_topic), "%sINFO2", tele_base);
     snprintf(s_json, sizeof(s_json),
         "{\"Info2\":{\"WebServerMode\":\"Admin\",\"Hostname\":\"%s\","
@@ -464,32 +431,17 @@ static void publish_info(const MqttConfig_t *cfg)
         cfg->client_id, ip_str);
     MQTT_Publish(s_info_topic, (uint8_t *)s_json, (uint16_t)strlen(s_json));
 
-    // INFO3
     snprintf(s_info_topic, sizeof(s_info_topic), "%sINFO3", tele_base);
     snprintf(s_json, sizeof(s_json),
         "{\"Info3\":{\"RestartReason\":\"Power on\",\"BootCount\":1}}");
     MQTT_Publish(s_info_topic, (uint8_t *)s_json, (uint16_t)strlen(s_json));
 }
 
-
 // =============================================================================
-// PUBLISH STATUS — persis Tasmota, disesuaikan STM32+W5500+CAN
+// PUBLISH STATUS
 // =============================================================================
-//static void build_stat_topic(const char *suffix, char *out, uint16_t len)
-//{
-//    // Bangun stat/topic/SUFFIXnya
-//    MqttConfig_BuildTopic((const MqttConfig_t *)0, "stat", out, len);
-//    // Tidak bisa pakai cfg di sini — pakai s_t_result sebagai base
-//    // s_t_result = "stat/topic/RESULT" → ambil base sampai "RESULT"
-//    uint16_t base_len = (uint16_t)(strrchr(s_t_result, '/') - s_t_result + 1);
-//    memcpy(out, s_t_result, base_len);
-//    out[base_len] = '\0';
-//    strncat(out, suffix, len - base_len - 1);
-//}
-
 static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
 {
-    // Build topic stat/topic/STATUSn
     char ip_str[16];
     snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
              g_dhcp_ip[0], g_dhcp_ip[1], g_dhcp_ip[2], g_dhcp_ip[3]);
@@ -498,7 +450,6 @@ static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
     snprintf(gw_str, sizeof(gw_str), "%d.%d.%d.%d",
              g_dhcp_ip[0], g_dhcp_ip[1], g_dhcp_ip[2], 1);
 
-    // Build stat topic
     uint16_t base_len = (uint16_t)(strrchr(s_t_result, '/') - s_t_result + 1);
     memcpy(s_info_topic, s_t_result, base_len);
     s_info_topic[base_len] = '\0';
@@ -512,20 +463,17 @@ static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
     }
 
     switch (n) {
-        case 0:  // STATUS — ringkasan
+        case 0:
             snprintf(s_json, sizeof(s_json),
                 "{\"Status\":{\"Module\":1,\"DeviceName\":\"%s\","
-                "\"FriendlyName\":[\"  %s\"],\"Topic\":\"%s\","
+                "\"FriendlyName\":[\"%s\"],\"Topic\":\"%s\","
                 "\"OtaUrl\":\"http://%s/ota\","
                 "\"Power\":\"%s\",\"PowerOnState\":1,"
                 "\"TelePeriod\":%d}}",
-                cfg->client_id, cfg->topic, cfg->topic,
-                ip_str,
-                g_can_b_data.relay_state ? "1" : "0",
-                cfg->tele_period);
+                cfg->client_id, cfg->topic, cfg->topic, ip_str,
+                g_can_b_data.relay_state ? "1" : "0", cfg->tele_period);
             break;
-
-        case 1:  // STATUS1 — parameter
+        case 1:
             format_uptime(s_uptime, s_uptime_sec);
             snprintf(s_json, sizeof(s_json),
                 "{\"StatusPRM\":{\"OtaUrl\":\"http://%s/ota\","
@@ -533,35 +481,30 @@ static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
                 "\"Uptime\":\"%s\",\"UptimeSec\":%lu,"
                 "\"Sleep\":0,\"BootCount\":1,"
                 "\"TelePeriod\":%d}}",
-                ip_str, s_uptime, (unsigned long)s_uptime_sec,
-                cfg->tele_period);
+                ip_str, s_uptime, (unsigned long)s_uptime_sec, cfg->tele_period);
             break;
-
-        case 2:  // STATUS2 — firmware
+        case 2:
             snprintf(s_json, sizeof(s_json),
                 "{\"StatusFWR\":{\"Version\":\"1.0.0(stm32-w5500)\","
                 "\"BuildDateTime\":\"2026-09-30T00:00:00\","
                 "\"CpuFrequency\":72,\"Hardware\":\"STM32F103C8T6\","
                 "\"Core\":\"LL Driver\"}}");
             break;
-
-        case 3:  // STATUS3 — log/serial/CAN
+        case 3:
             snprintf(s_json, sizeof(s_json),
                 "{\"StatusLOG\":{\"TelePeriod\":%d,"
                 "\"CANSpeed\":500,\"RS485Baud\":115200,"
                 "\"SerialConfig\":\"8N1\"}}",
                 cfg->tele_period);
             break;
-
-        case 4:  // STATUS4 — memori
+        case 4:
             snprintf(s_json, sizeof(s_json),
                 "{\"StatusMEM\":{\"ProgramSize\":34,"
                 "\"FlashSize\":8192,\"FlashChipId\":\"W25Q64\","
                 "\"FlashFrequency\":36,\"FlashMode\":\"SPI\","
                 "\"RAM\":20,\"RAMFree\":16}}");
             break;
-
-        case 5:  // STATUS5 — network
+        case 5:
             snprintf(s_json, sizeof(s_json),
                 "{\"StatusNET\":{\"Hostname\":\"%s\","
                 "\"IPAddress\":\"%s\",\"Gateway\":\"%s\","
@@ -569,22 +512,18 @@ static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
                 "\"DNSServer\":\"%s\","
                 "\"Mac\":\"00:08:DC:11:22:33\"}}",
                 cfg->client_id, ip_str, gw_str,
-                g_dhcp_ip[0], g_dhcp_ip[1], g_dhcp_ip[2], 0,
-                gw_str);
+                g_dhcp_ip[0], g_dhcp_ip[1], g_dhcp_ip[2], 0, gw_str);
             break;
-
-        case 6:  // STATUS6 — MQTT
+        case 6:
             snprintf(s_json, sizeof(s_json),
                 "{\"StatusMQT\":{\"MqttHost\":\"%s\","
                 "\"MqttPort\":%d,\"MqttClient\":\"%s\","
                 "\"MqttUser\":\"%s\",\"MqttCount\":%d,"
                 "\"KEEPALIVE\":%d,\"MqttTLS\":0}}",
                 cfg->host, cfg->port, cfg->client_id,
-                cfg->user, g_mqtt_conn_count,
-                MQTT_KEEPALIVE_SEC);
+                cfg->user, g_mqtt_conn_count, MQTT_KEEPALIVE_SEC);
             break;
-
-        case 7:  // STATUS7 — time (tanpa RTC, pakai uptime)
+        case 7:
             format_uptime(s_uptime, s_uptime_sec);
             format_time(s_time);
             snprintf(s_json, sizeof(s_json),
@@ -593,43 +532,38 @@ static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
                 "\"Timezone\":\"+07:00\"}}",
                 s_time, s_uptime, (unsigned long)s_uptime_sec);
             break;
-
-        case 8:  // STATUS8 — sensor (ENERGY dummy)
+        case 8:
             format_time(s_time);
             snprintf(s_json, sizeof(s_json),
-                   "{\"StatusSNS\":{\"Time\":\"%s\","
-                   "\"Switch1\":\"%s\","
-                   "\"ENERGY\":{\"Voltage\":%d.%d,"
-                   "\"Current\":0.000,\"Power\":0,\"Total\":0.000},"
-                   "\"Temperature\":%d,"
-                   "\"Uptime\":%d,"
-                   "\"Counter\":%d}}",
-                   s_time,
-                   g_can_b_data.relay_state ? "ON" : "OFF",
-                	g_can_b_data.voltage / 10,
-					g_can_b_data.voltage % 10,
-                   g_can_b_data.temperature,
-                   g_can_b_data.uptime,
-                   g_can_b_data.counter);
+                "{\"StatusSNS\":{\"Time\":\"%s\","
+                "\"Switch1\":\"%s\","
+                "\"ENERGY\":{\"Voltage\":%d.%d,"
+                "\"Current\":0.000,\"Power\":0,\"Total\":0.000},"
+                "\"Temperature\":%d,"
+                "\"Uptime\":%d,"
+                "\"Counter\":%d}}",
+                s_time,
+                g_can_b_data.relay_state ? "ON" : "OFF",
+                g_can_b_data.voltage / 10, g_can_b_data.voltage % 10,
+                g_can_b_data.temperature,
+                g_can_b_data.uptime,
+                g_can_b_data.counter);
             break;
-
-        case 9:  // STATUS9 — power state
-        	 snprintf(s_json, sizeof(s_json),
-        	        "{\"StatusPWR\":{\"POWER\":\"%s\","
-        	        "\"PowerOnState\":1,\"LedState\":1}}",
-        	        g_can_b_data.relay_state ? "ON" : "OFF");
+        case 9:
+            snprintf(s_json, sizeof(s_json),
+                "{\"StatusPWR\":{\"POWER\":\"%s\","
+                "\"PowerOnState\":1,\"LedState\":1}}",
+                g_can_b_data.relay_state ? "ON" : "OFF");
             break;
-
-        case 10:  // STATUS10 — CAN Bus info
-        	snprintf(s_json, sizeof(s_json),
-        	        "{\"StatusCAN\":{\"CANSpeed\":500,"
-        	        "\"CANStatus\":\"Ready\","
-        	        "\"CANTxCount\":%lu,\"CANRxCount\":%lu}}",
-        	        (unsigned long)g_can_tx_count,
-        	        (unsigned long)g_can_rx_count);
+        case 10:
+            snprintf(s_json, sizeof(s_json),
+                "{\"StatusCAN\":{\"CANSpeed\":500,"
+                "\"CANStatus\":\"Ready\","
+                "\"CANTxCount\":%lu,\"CANRxCount\":%lu}}",
+                (unsigned long)g_can_tx_count,
+                (unsigned long)g_can_rx_count);
             break;
-
-        case 11:  // STATUS11 — ringkasan STATE
+        case 11:
             format_uptime(s_uptime, s_uptime_sec);
             format_time(s_time);
             snprintf(s_json, sizeof(s_json),
@@ -644,7 +578,6 @@ static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
                 g_can_b_data.relay_state ? "ON" : "OFF",
                 ip_str);
             break;
-
         default:
             return;
     }
@@ -652,14 +585,14 @@ static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
     MQTT_Publish(s_info_topic, (uint8_t *)s_json, (uint16_t)strlen(s_json));
 }
 
-// Proses antrian status command — dipanggil tiap loop saat CONNECTED
-// STATUS0 = kirim STATUS, STATUS1...STATUS11 satu per satu
+// =============================================================================
+// Proses antrian status command
+// =============================================================================
 static void process_status_queue(const MqttConfig_t *cfg)
 {
     if (s_status_cmd < 0) return;
 
     if (s_status_cmd == 0) {
-        // Kirim satu per satu tiap loop: STATUS, STATUS1, ..., STATUS11
         publish_status_n(cfg, s_status_step);
         s_status_step++;
         if (s_status_step > 11) {
@@ -667,14 +600,13 @@ static void process_status_queue(const MqttConfig_t *cfg)
             s_status_step = 0;
         }
     } else {
-        // Kirim STATUS tertentu langsung
         publish_status_n(cfg, (uint8_t)s_status_cmd);
         s_status_cmd = -1;
     }
 }
 
 // =============================================================================
-// HANDLE incoming MQTT packet (subscribe callback)
+// HANDLE incoming MQTT packet
 // =============================================================================
 static void mqtt_handle_incoming(const MqttConfig_t *cfg)
 {
@@ -685,27 +617,28 @@ static void mqtt_handle_incoming(const MqttConfig_t *cfg)
     uint16_t rd = R16(Sn_RX_RD), grab = (len > MQTT_BUF_SIZE) ? MQTT_BUF_SIZE : len;
     W5500_ReadBuf(rd, S2_RX_OP, s_buf, grab);
     rd += grab;
-    W5500_WriteReg(Sn_RX_RD, S2_REG_OP, rd >> 8);
+    W5500_WriteReg(Sn_RX_RD,     S2_REG_OP, rd >> 8);
     W5500_WriteReg(Sn_RX_RD + 1, S2_REG_OP, (uint8_t)rd);
-    W5500_WriteReg(Sn_CR, S2_REG_OP, CMD_RECV);
+    W5500_WriteReg(Sn_CR,        S2_REG_OP, CMD_RECV);
     s2_wait_cr(10);
 
     uint8_t type = s_buf[0] & 0xF0;
     if (type == MQTT_CONNACK) {
-        if (!s_buf[3])
-        {
-        	g_mqtt_conn_count++;
-        	g_mqtt_state = MQTT_STATE_CONNECTED;
-        	s_startup_step = 0;
-        	 s_startup_tick  = g_ms_tick;
-        	s_last_ping = s_last_pub = g_ms_tick;
+        if (!s_buf[3]) {
+            g_mqtt_conn_count++;
+            g_mqtt_state    = MQTT_STATE_CONNECTED;
+            s_startup_step  = 0;
+            s_startup_tick  = g_ms_tick;
+            s_last_ping = s_last_pub = g_ms_tick;
+        } else {
+            g_mqtt_state = MQTT_STATE_RECONNECT;
+            s_tick_ref   = g_ms_tick;
         }
-        else { g_mqtt_state = MQTT_STATE_RECONNECT; s_tick_ref = g_ms_tick; }
         return;
     }
     if (type != MQTT_PUBLISH) return;
 
-    uint8_t  hsz = (s_buf[1] & 0x80) ? 3 : 2;
+    uint8_t  hsz  = (s_buf[1] & 0x80) ? 3 : 2;
     uint16_t tlen = ((uint16_t)s_buf[hsz] << 8) | s_buf[hsz + 1];
     if (hsz + 2 + tlen >= grab || tlen >= sizeof(s_info_topic)) return;
 
@@ -713,7 +646,7 @@ static void mqtt_handle_incoming(const MqttConfig_t *cfg)
     s_info_topic[tlen] = '\0';
 
     char *pay = (char *)&s_buf[hsz + 2 + tlen];
-    s_buf[grab] = '\0'; // terminasi string payload
+    s_buf[grab] = '\0';
 
     size_t clen = strlen(s_t_cmnd);
     if (strncasecmp(s_info_topic, s_t_cmnd, clen)) return;
@@ -721,57 +654,88 @@ static void mqtt_handle_incoming(const MqttConfig_t *cfg)
 
     // Dispatch Command
     if (!strcasecmp(cmd, "POWER")) {
-        if (!strcasecmp(pay, "ON")) g_can_b_data.relay_state = 1;
-        else if (!strcasecmp(pay, "OFF")) g_can_b_data.relay_state = 0;
+        if      (!strcasecmp(pay, "ON"))     g_can_b_data.relay_state = 1;
+        else if (!strcasecmp(pay, "OFF"))    g_can_b_data.relay_state = 0;
         else if (!strcasecmp(pay, "TOGGLE")) g_can_b_data.relay_state ^= 1;
-        CAN_Bus_SendCmd(&hcan, g_can_b_data.relay_state ? RELAY_CMD_ON : RELAY_CMD_OFF);
+        CAN_Bus_SendCmd(g_can_b_data.relay_state ? RELAY_CMD_ON : RELAY_CMD_OFF);
         const char *st = g_can_b_data.relay_state ? "ON" : "OFF";
         snprintf(s_json, sizeof(s_json), "{\"POWER\":\"%s\"}", st);
         MQTT_Publish(s_t_result, (uint8_t *)s_json, strlen(s_json));
         MQTT_Publish(s_t_power,  (uint8_t *)st, strlen(st));
     }
-    else if (!strcasecmp(cmd, "TelePeriod")) s_pub_interval = (uint32_t)atoi(pay) * 1000UL;
-    else if (!strcasecmp(cmd, "Status"))     { s_status_cmd = (int8_t)atoi(pay); s_status_step = 0; }
+    else if (!strcasecmp(cmd, "TelePeriod")) {
+        s_pub_interval = (uint32_t)atoi(pay) * 1000UL;
+    }
+    else if (!strcasecmp(cmd, "Status")) {
+        s_status_cmd  = (int8_t)atoi(pay);
+        s_status_step = 0;
+    }
     else if (!strcasecmp(cmd, "Restart") && pay[0] == '1') {
         MQTT_Publish(s_t_result, (uint8_t *)"{\"Restart\":\"Restarting\"}", 24);
         volatile uint32_t d = 720000; while (d--);
         extern void NVIC_SystemReset(void); NVIC_SystemReset();
     }
     else if (!strcasecmp(cmd, "CAN")) {
-        char *pi = strstr(pay, "\"id\":\""), *pm = strstr(pay, "\"msg\":\"");
+        char *pi = strstr(pay, "\"id\":\"");
+        char *pm = strstr(pay, "\"msg\":\"");
         if (pi && pm) {
-            uint8_t d[8], dlc = 0, *p = (uint8_t *)pm + 7;
+            uint8_t  d[8] = {0}, dlc = 0;
+            uint8_t *p = (uint8_t *)pm + 7;
             #define N(c) (((c)|0x20) > '9' ? ((c)|0x20)-'a'+10 : (c)-'0')
-            while (*p != '"' && *(p+1) != '"' && dlc < 8) { d[dlc++] = (N(*p) << 4) | N(*(p+1)); p += 2; }
+            while (*p != '"' && *(p+1) != '"' && dlc < 8) {
+                d[dlc++] = (N(*p) << 4) | N(*(p+1));
+                p += 2;
+            }
             #undef N
-            CAN_TxHeaderTypeDef hdr = { .StdId = strtoul(pi + 6, NULL, 16), .DLC = dlc };
-            uint32_t box;
-            if (dlc && HAL_CAN_AddTxMessage(&hcan, &hdr, d, &box) == HAL_OK) {
-                snprintf(s_json, sizeof(s_json), "{\"CAN_OK\":{\"id\":\"%lX\",\"dlc\":%u}}", hdr.StdId, dlc);
+
+            uint32_t can_id = strtoul(pi + 6, NULL, 16);
+
+            // Cari mailbox kosong
+            uint8_t mb = 0xFF;
+            if      (CAN1->TSR & CAN_TSR_TME0) mb = 0;
+            else if (CAN1->TSR & CAN_TSR_TME1) mb = 1;
+            else if (CAN1->TSR & CAN_TSR_TME2) mb = 2;
+
+            if (dlc && mb != 0xFF) {
+                if (can_id <= 0x7FFU)
+                    CAN1->sTxMailBox[mb].TIR = (can_id << 21);
+                else
+                    CAN1->sTxMailBox[mb].TIR = ((can_id << 3) & CAN_TI0R_EXID) | CAN_TI0R_IDE;
+
+                CAN1->sTxMailBox[mb].TDTR = dlc;
+                CAN1->sTxMailBox[mb].TDLR = ((uint32_t)d[0])       | ((uint32_t)d[1] << 8)
+                                           | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+                CAN1->sTxMailBox[mb].TDHR = ((uint32_t)d[4])       | ((uint32_t)d[5] << 8)
+                                           | ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24);
+                CAN1->sTxMailBox[mb].TIR |= CAN_TI0R_TXRQ;
+
+                snprintf(s_json, sizeof(s_json),
+                    "{\"CAN_OK\":{\"id\":\"%lX\",\"dlc\":%u}}",
+                    (unsigned long)can_id, dlc);
                 MQTT_Publish(s_t_result, (uint8_t *)s_json, strlen(s_json));
             }
         }
     }
     #undef R16
 }
+
 // =============================================================================
 // FUNGSI PUBLIK: Init
 // =============================================================================
 void MQTT_Init(void)
 {
-    // Alokasi buffer Socket 2
-    W5500_WriteReg(0x001E, S2_REG_OP, 2);  // Socket 2 TX 2KB
-    W5500_WriteReg(0x001F, S2_REG_OP, 2);  // Socket 2 RX 2KB
+    W5500_WriteReg(0x001E, S2_REG_OP, 2);
+    W5500_WriteReg(0x001F, S2_REG_OP, 2);
 
-    g_mqtt_state    = MQTT_STATE_IDLE;
+    g_mqtt_state      = MQTT_STATE_IDLE;
     g_mqtt_conn_count = 0;
     g_mqtt_pub_count  = 0;
-    s_uptime_sec    = 0;
-    s_last_uptime   = g_ms_tick;
+    s_uptime_sec      = 0;
+    s_last_uptime     = g_ms_tick;
 }
 
 // =============================================================================
-// FUNGSI PUBLIK: Process (dipanggil setiap loop)
+// FUNGSI PUBLIK: Process
 // =============================================================================
 void MQTT_Process(const MqttConfig_t *cfg)
 {
@@ -780,13 +744,11 @@ void MQTT_Process(const MqttConfig_t *cfg)
         return;
     }
 
-    // Update uptime
     if ((g_ms_tick - s_last_uptime) >= 1000) {
         s_uptime_sec++;
         s_last_uptime += 1000;
     }
 
-    // Interval publish dari config
     if (s_pub_interval == 0) {
         s_pub_interval = (uint32_t)cfg->tele_period * 1000UL;
     }
@@ -795,11 +757,8 @@ void MQTT_Process(const MqttConfig_t *cfg)
 
     switch (g_mqtt_state) {
 
-        // =====================================================================
         case MQTT_STATE_IDLE:
-        // =====================================================================
         {
-            // Bangun topic cache dari config — reuse s_json sebagai temp buffer
             MqttConfig_BuildTopic(cfg, "tele", s_json, 80);
             snprintf(s_t_lwt,    sizeof(s_t_lwt),    "%sLWT",    s_json);
             snprintf(s_t_state,  sizeof(s_t_state),  "%sSTATE",  s_json);
@@ -809,29 +768,23 @@ void MQTT_Process(const MqttConfig_t *cfg)
             snprintf(s_t_power,  sizeof(s_t_power),  "%sPOWER",  s_json);
             MqttConfig_BuildTopic(cfg, "cmnd", s_t_cmnd, sizeof(s_t_cmnd));
 
-            // Tutup socket dulu kalau perlu
             if (sr != SOCK_CLOSED) {
                 W5500_WriteReg(Sn_CR, S2_REG_OP, CMD_CLOSE);
                 s2_wait_cr(50);
                 break;
             }
 
-            // Buka socket TCP
-            W5500_WriteReg(Sn_MR,      S2_REG_OP, 0x01);   // TCP mode
-            W5500_WriteReg(Sn_PORT,    S2_REG_OP, 0x00);
-            W5500_WriteReg(Sn_PORT+1,  S2_REG_OP, 0xC8);   // source port 200
-            W5500_WriteReg(Sn_CR,      S2_REG_OP, CMD_OPEN);
+            W5500_WriteReg(Sn_MR,     S2_REG_OP, 0x01);
+            W5500_WriteReg(Sn_PORT,   S2_REG_OP, 0x00);
+            W5500_WriteReg(Sn_PORT+1, S2_REG_OP, 0xC8);
+            W5500_WriteReg(Sn_CR,     S2_REG_OP, CMD_OPEN);
             s2_wait_cr(50);
 
-            // Parse IP string ke bytes manual (hindari sscanf di embedded)
             uint8_t ip[4] = {0};
             const char *p = cfg->host;
             for (int idx = 0; idx < 4; idx++) {
                 uint16_t val = 0;
-                while (*p >= '0' && *p <= '9') {
-                    val = val * 10 + (*p - '0');
-                    p++;
-                }
+                while (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); p++; }
                 ip[idx] = (uint8_t)val;
                 if (*p == '.') p++;
             }
@@ -839,7 +792,6 @@ void MQTT_Process(const MqttConfig_t *cfg)
             W5500_WriteReg(Sn_DPORT,   S2_REG_OP, (uint8_t)(cfg->port >> 8));
             W5500_WriteReg(Sn_DPORT+1, S2_REG_OP, (uint8_t)(cfg->port));
 
-            // Connect
             W5500_WriteReg(Sn_CR, S2_REG_OP, CMD_CONNECT);
             s2_wait_cr(50);
 
@@ -848,16 +800,12 @@ void MQTT_Process(const MqttConfig_t *cfg)
             break;
         }
 
-        // =====================================================================
         case MQTT_STATE_TCP_CONN:
-        // =====================================================================
             if (sr == SOCK_ESTABLISHED) {
-                // TCP tersambung → kirim MQTT CONNECT
                 mqtt_send_connect(cfg);
                 g_mqtt_state = MQTT_STATE_MQTT_CONN;
                 s_tick_ref   = g_ms_tick;
             } else if ((g_ms_tick - s_tick_ref) > MQTT_CONN_TIMEOUT_MS) {
-                // Timeout → coba lagi
                 W5500_WriteReg(Sn_CR, S2_REG_OP, CMD_CLOSE);
                 s2_wait_cr(50);
                 g_mqtt_state = MQTT_STATE_RECONNECT;
@@ -865,11 +813,9 @@ void MQTT_Process(const MqttConfig_t *cfg)
             }
             break;
 
-        // =====================================================================
         case MQTT_STATE_MQTT_CONN:
-        // =====================================================================
-            mqtt_handle_incoming(cfg);  // tunggu CONNACK
-            if (g_mqtt_state == MQTT_STATE_CONNECTED) break;  // berhasil
+            mqtt_handle_incoming(cfg);
+            if (g_mqtt_state == MQTT_STATE_CONNECTED) break;
             if ((g_ms_tick - s_tick_ref) > MQTT_CONN_TIMEOUT_MS) {
                 W5500_WriteReg(Sn_CR, S2_REG_OP, CMD_CLOSE);
                 s2_wait_cr(50);
@@ -878,32 +824,24 @@ void MQTT_Process(const MqttConfig_t *cfg)
             }
             break;
 
-        // =====================================================================
         case MQTT_STATE_CONNECTED:
-        // =====================================================================
-            // Cek koneksi TCP masih hidup
             if (sr != SOCK_ESTABLISHED) {
                 g_mqtt_state = MQTT_STATE_RECONNECT;
                 s_tick_ref   = g_ms_tick;
                 break;
             }
 
-
             if ((g_ms_tick - s_startup_tick) < 200) break;
             s_startup_tick = g_ms_tick;
 
-            // Startup sequence — kirim satu per satu tiap loop
-            // agar tidak overflow TX buffer 2KB
             if (s_startup_step < 6) {
                 switch (s_startup_step) {
                     case 0:
-                        // Subscribe cmnd/# — reuse s_json sbg temp
                         snprintf(s_json, sizeof(s_json), "%s#", s_t_cmnd);
                         mqtt_subscribe(s_json);
                         break;
                     case 1:
-//                        MQTT_Publish(s_t_lwt, (uint8_t *)"Online", 6);
-                    	 mqtt_publish_retain(s_t_lwt, (uint8_t *)"Online", 6);
+                        mqtt_publish_retain(s_t_lwt, (uint8_t *)"Online", 6);
                         break;
                     case 2:
                         publish_info(cfg);
@@ -923,19 +861,14 @@ void MQTT_Process(const MqttConfig_t *cfg)
                 break;
             }
 
-            // Baca incoming (command dari broker)
             mqtt_handle_incoming(cfg);
-
-            // Proses antrian Status command (STATUS0 kirim satu per loop)
             process_status_queue(cfg);
 
-            // PINGREQ setiap KEEPALIVE/2 detik
             if ((g_ms_tick - s_last_ping) >= (MQTT_KEEPALIVE_SEC * 500UL)) {
                 mqtt_pingreq();
                 s_last_ping = g_ms_tick;
             }
 
-            // Publish tele STATE + SENSOR setiap tele_period
             if ((g_ms_tick - s_last_pub) >= s_pub_interval) {
                 publish_state(cfg);
                 publish_sensor();
@@ -943,10 +876,7 @@ void MQTT_Process(const MqttConfig_t *cfg)
             }
             break;
 
-        // =====================================================================
         case MQTT_STATE_RECONNECT:
-        // =====================================================================
-            // Tunggu 5 detik sebelum reconnect
             if ((g_ms_tick - s_tick_ref) > 5000) {
                 g_mqtt_state = MQTT_STATE_IDLE;
             }
