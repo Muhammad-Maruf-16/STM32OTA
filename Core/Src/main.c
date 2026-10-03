@@ -30,6 +30,8 @@
 #include "mqtt_client.h"
 #include "can_bus.h"
 #include "web_cmnd.h"
+#include "html_flash.h"
+#include "html_landing.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -83,7 +85,7 @@
 
 #define W5500_S0_BUF_MASK     0x1FFF
 #define CHUNK_BUFFER_SIZE     (256)
-static uint8_t ram_buffer[CHUNK_BUFFER_SIZE];
+uint8_t ram_buffer[CHUNK_BUFFER_SIZE];
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -376,30 +378,9 @@ void W5500_SendTCP(const uint8_t *data, uint16_t len)
 
 // ==============================================================================
 // 4. WEB OTA HANDLER
+// HTML_PAGE dihapus — dashboard di-serve dari SPI Flash (html_flash)
+// Fallback ke HTML_LANDING (html_landing.h) jika SPI Flash kosong/corrupt
 // ==============================================================================
-const char HTML_PAGE[] =
-"<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;padding:20px;'>"
-"<h2>STM32 OTA Web Uploader</h2>"
-"<input type='file' id='f'><br><br>"
-"<button onclick='upload()'>Upload & Update</button>"
-"<h4 id='st'>Pilih file .bin</h4>"
-"<script>"
-"function crc32(b){let v=new DataView(b.buffer,b.byteOffset,b.byteLength),c=0xFFFFFFFF,p=0x04C11DB7,w=Math.floor(b.length/4);"
-"for(let i=0;i<w;i++){c^=v.getUint32(i*4,true);for(let k=0;k<32;k++)c=(c&0x80000000)?((c<<1)^p)>>>0:(c<<1)>>>0;}"
-"return '0x'+(c>>>0).toString(16).toUpperCase();}"
-"async function upload(){"
-"let file=document.getElementById('f').files[0]; if(!file)return;"
-"let arr=new Uint8Array(await file.arrayBuffer());"
-"let hexCrc=crc32(arr);"
-"document.getElementById('st').innerText='Mengunggah... (CRC: '+hexCrc+')';"
-"try{"
-"  let res=await fetch('/ota?sz='+arr.length+'&crc='+hexCrc,{method:'POST',body:arr});"
-"  let txt=await res.text();"
-"  document.getElementById('st').innerText=txt;"
-"}catch(e){"
-"  document.getElementById('st').innerText='Update Gagal! Coba lagi.';}"
-"}"
-"</script></body></html>";
 
 void Process_Web_OTA(void)
 
@@ -940,21 +921,21 @@ void Process_Web_OTA(void)
 
 
 
-  // GET / — Kirim halaman web
+  // GET / — Kirim dashboard dari SPI Flash, fallback ke landing page
 
   if (strstr((char *)ram_buffer, "GET /") != NULL) {
 
-    char header[128];
-
-    sprintf(header,
-
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-
-            strlen(HTML_PAGE));
-
-    W5500_SendTCP((uint8_t *)header, strlen(header));
-
-    W5500_SendTCP((const uint8_t *)HTML_PAGE, strlen(HTML_PAGE));
+    if (HtmlFlash_IsValid()) {
+      HtmlFlash_SendPage();
+    } else {
+      uint16_t llen = (uint16_t)strlen(HTML_LANDING);
+      char header[128];
+      sprintf(header,
+              "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+              llen);
+      W5500_SendTCP((uint8_t *)header, strlen(header));
+      W5500_SendTCP((const uint8_t *)HTML_LANDING, llen);
+    }
 
     rx_rd += rx_len;
 
@@ -972,6 +953,163 @@ void Process_Web_OTA(void)
     while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP))
       ;
 
+    return;
+  }
+
+  // POST /html-upload — Terima file HTML, simpan ke SPI Flash
+  // Logika identik dengan POST /ota yang sudah proven, hanya beda target address
+
+  if (strstr((char *)ram_buffer, "POST /html-upload") != NULL) {
+
+    char *pSize = strstr((char *)ram_buffer, "?sz=");
+    char *pCrc  = strstr((char *)ram_buffer, "&crc=");
+    if (!pSize || !pCrc) return;
+
+    uint32_t expected_size = strtoul(pSize + 4, NULL, 10);
+    uint32_t expected_crc  = strtoul(pCrc  + 5, NULL, 0);
+
+    if (expected_size == 0 || expected_size > HTML_FLASH_DATA_MAX) {
+      const char err[] = "HTTP/1.1 400 Bad\r\nConnection: close\r\n\r\nFile terlalu besar!";
+      W5500_SendTCP((uint8_t *)err, strlen(err));
+      W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_DISCON);
+      while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
+      return;
+    }
+
+    // == IDENTIK OTA: cari \r\n\r\n dengan overlap 4 byte ==
+    uint8_t  html_rx_already_updated = 0;
+    uint8_t  html_tail[4] = { 0 };
+    char    *pBody = NULL;
+
+    while (pBody == NULL) {
+
+      uint8_t overlap[4 + CHUNK_BUFFER_SIZE];
+      memcpy(overlap, html_tail, 4);
+      memcpy(overlap + 4, ram_buffer, fetch);
+      overlap[4 + fetch] = '\0';
+
+      char *found = strstr((char *)overlap, "\r\n\r\n");
+      if (found) {
+        int pos_in_overlap = (found - (char *)overlap);
+        int pos_in_buf     = pos_in_overlap - 4;
+        int body_start     = pos_in_buf + 4;
+        if (body_start < 0)      body_start = 0;
+        if (body_start > fetch)  body_start = fetch;
+        pBody = (char *)ram_buffer + body_start;
+
+        rx_rd += fetch;
+        W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+        W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+        W5500_WriteReg(Sn_CR,         W5500_S0_REG_OP, CMD_RECV);
+        while (W5500_ReadReg(Sn_CR,   W5500_S0_REG_OP));
+        html_rx_already_updated = 1;
+
+      } else {
+        memcpy(html_tail, ram_buffer + fetch - 4, 4);
+        rx_rd += fetch;
+        W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+        W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+        W5500_WriteReg(Sn_CR,         W5500_S0_REG_OP, CMD_RECV);
+        while (W5500_ReadReg(Sn_CR,   W5500_S0_REG_OP));
+
+        rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR,     W5500_S0_REG_OP) << 8) |
+                             W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
+        if (rx_len == 0) continue;
+        fetch = (rx_len > (CHUNK_BUFFER_SIZE - 1)) ? (CHUNK_BUFFER_SIZE - 1) : rx_len;
+        s_off = rx_rd & W5500_S0_BUF_MASK;
+        W5500_ReadBuf(s_off, W5500_S0_RX_OP, ram_buffer, fetch);
+        ram_buffer[fetch] = '\0';
+      }
+    }
+
+    // == IDENTIK OTA: erase sektor target ==
+    ExtFlash_EraseSector(HTML_FLASH_META_ADDR);
+    LL_IWDG_ReloadCounter(IWDG);
+    uint32_t html_sectors = (expected_size + 4095) / 4096;
+    for (uint32_t s = 0; s < html_sectors; s++) {
+      ExtFlash_EraseSector(HTML_FLASH_DATA_ADDR + (s * 4096));
+      LL_IWDG_ReloadCounter(IWDG);
+    }
+
+    // == IDENTIK OTA: tulis chunk awal body ==
+    uint16_t header_len      = (uint8_t *)pBody - ram_buffer;
+    uint16_t body_in_packet  = fetch - header_len;
+    uint32_t bytes_received  = 0;
+
+    if (body_in_packet > 0) {
+      uint16_t written = 0;
+      while (written < body_in_packet) {
+        uint32_t cur_flash   = HTML_FLASH_DATA_ADDR + written;
+        uint16_t page_offset = cur_flash & 0xFF;
+        uint16_t space_left  = 256 - page_offset;
+        uint16_t page_len    = (body_in_packet - written > space_left)
+                                ? space_left : (body_in_packet - written);
+        ExtFlash_WritePage(cur_flash, (uint8_t *)pBody + written, page_len);
+        written += page_len;
+      }
+      bytes_received += body_in_packet;
+    }
+
+    if (!html_rx_already_updated) {
+      rx_rd += fetch;
+      W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+      W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+      W5500_WriteReg(Sn_CR,         W5500_S0_REG_OP, CMD_RECV);
+      while (W5500_ReadReg(Sn_CR,   W5500_S0_REG_OP));
+    }
+
+    // == IDENTIK OTA: stream sisa payload ==
+    while (bytes_received < expected_size) {
+      rx_len = ((uint16_t)W5500_ReadReg(Sn_RX_RSR,     W5500_S0_REG_OP) << 8) |
+                           W5500_ReadReg(Sn_RX_RSR + 1, W5500_S0_REG_OP);
+      if (rx_len == 0) continue;
+
+      rx_rd = ((uint16_t)W5500_ReadReg(Sn_RX_RD,     W5500_S0_REG_OP) << 8) |
+                          W5500_ReadReg(Sn_RX_RD + 1, W5500_S0_REG_OP);
+
+      uint16_t grab = (rx_len > CHUNK_BUFFER_SIZE) ? CHUNK_BUFFER_SIZE : rx_len;
+      if (bytes_received + grab > expected_size) grab = expected_size - bytes_received;
+
+      s_off = rx_rd & W5500_S0_BUF_MASK;
+      if ((s_off + grab) > (W5500_S0_BUF_MASK + 1)) {
+        uint16_t p1 = (W5500_S0_BUF_MASK + 1) - s_off;
+        W5500_ReadBuf(s_off,   W5500_S0_RX_OP, ram_buffer,      p1);
+        W5500_ReadBuf(0x0000,  W5500_S0_RX_OP, ram_buffer + p1, grab - p1);
+      } else {
+        W5500_ReadBuf(s_off, W5500_S0_RX_OP, ram_buffer, grab);
+      }
+
+      uint16_t written = 0;
+      while (written < grab) {
+        uint32_t cur_flash   = HTML_FLASH_DATA_ADDR + bytes_received + written;
+        uint16_t page_offset = cur_flash & 0xFF;
+        uint16_t space_left  = 256 - page_offset;
+        uint16_t page_len    = (grab - written > space_left)
+                                ? space_left : (grab - written);
+        ExtFlash_WritePage(cur_flash, &ram_buffer[written], page_len);
+        written += page_len;
+      }
+
+      bytes_received += grab;
+      rx_rd += grab;
+      W5500_WriteReg(Sn_RX_RD,     W5500_S0_REG_OP, (uint8_t)(rx_rd >> 8));
+      W5500_WriteReg(Sn_RX_RD + 1, W5500_S0_REG_OP, (uint8_t)rx_rd);
+      W5500_WriteReg(Sn_CR,         W5500_S0_REG_OP, CMD_RECV);
+      while (W5500_ReadReg(Sn_CR,   W5500_S0_REG_OP));
+      LL_IWDG_ReloadCounter(IWDG);
+    }
+
+    // == Verifikasi CRC & simpan meta ==
+    if (HtmlFlash_VerifyAndSaveMeta(expected_size, expected_crc)) {
+      const char ok[] = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nHTML tersimpan!";
+      W5500_SendTCP((uint8_t *)ok, strlen(ok));
+    } else {
+      const char fail[] = "HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nCRC Mismatch!";
+      W5500_SendTCP((uint8_t *)fail, strlen(fail));
+    }
+
+    W5500_WriteReg(Sn_CR, W5500_S0_REG_OP, CMD_DISCON);
+    while (W5500_ReadReg(Sn_CR, W5500_S0_REG_OP));
     return;
   }
 
@@ -1375,7 +1513,6 @@ int main(void)
   __enable_irq();
 
 //  for (volatile uint32_t i = 0; i < 720000; i++);
-  extern uint32_t _Min_Stack_Size;
   extern uint32_t _ebss;
   uint32_t *stack_start = &_ebss;
   uint32_t *stack_end   = (uint32_t *)(0x20000000 + 20*1024);
@@ -1450,7 +1587,6 @@ int main(void)
   W5500_WriteReg(0x001F, 0x48, 2);
   g_dbg_s2_tx_size = W5500_ReadReg(0x001E, 0x48);
 #endif
-  uint32_t led_tick = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1465,6 +1601,8 @@ int main(void)
 	  if ((HAL_GetTick() - last_test) >= 1000) {
 	      last_test = HAL_GetTick();
 	      CAN_Bus_SendCmd(&hcan, RELAY_CMD_STATUS_REQ);
+
+	      LL_GPIO_TogglePin(LED_BUILTIN_GPIO_Port, LED_BUILTIN_Pin);
 	  }
 
     DHCP_Process();
@@ -1497,13 +1635,6 @@ int main(void)
     }
 
     LL_IWDG_ReloadCounter(IWDG);
-
-
-    if (++led_tick > 100000)
-    {
-      LL_GPIO_TogglePin(LED_BUILTIN_GPIO_Port, LED_BUILTIN_Pin);
-      led_tick = 0;
-    }
 
   }
   /* USER CODE END 3 */

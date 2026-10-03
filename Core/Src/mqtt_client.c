@@ -94,6 +94,7 @@ static uint32_t s_uptime_sec = 0;   // uptime counter
 static uint32_t s_last_uptime = 0;  // untuk hitung uptime
 static uint32_t s_pub_interval = 0; // interval publish dari config (ms)
 static uint32_t s_last_pub = 0;     // waktu terakhir publish tele
+static uint32_t s_startup_tick = 0;
 
 // topic cache
 static char s_t_lwt [96];
@@ -335,6 +336,27 @@ static void mqtt_pingreq(void)
     s2_send(s_buf, 2);
 }
 
+// mqtt_client.c — fungsi baru untuk publish dengan retain flag
+static void mqtt_publish_retain(const char *topic, const uint8_t *payload, uint16_t plen)
+{
+    uint16_t topic_len = (uint16_t)strlen(topic);
+    uint32_t rem = 2 + topic_len + plen;
+
+    uint8_t rem_enc[4];
+    uint8_t rem_len = encode_remaining(rem_enc, rem);
+
+    uint16_t i = 0;
+    s_buf[i++] = MQTT_PUBLISH | 0x01;  // bit0 = retain flag
+    memcpy(&s_buf[i], rem_enc, rem_len); i += rem_len;
+    s_buf[i++] = (uint8_t)(topic_len >> 8);
+    s_buf[i++] = (uint8_t)(topic_len);
+    memcpy(&s_buf[i], topic, topic_len); i += topic_len;
+    memcpy(&s_buf[i], payload, plen);   i += plen;
+
+    s2_send(s_buf, i);
+    g_mqtt_pub_count++;
+}
+
 // =============================================================================
 // PUBLISH tele/STATE — mirip Tasmota Sonoff single relay
 // =============================================================================
@@ -422,11 +444,12 @@ static void publish_info(const MqttConfig_t *cfg)
     snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
              g_dhcp_ip[0], g_dhcp_ip[1], g_dhcp_ip[2], g_dhcp_ip[3]);
 
-    // INFO1 — reuse s_json sbg JSON, s_info_topic sbg topic
-    MqttConfig_BuildTopic(cfg, "tele", s_info_topic, sizeof(s_info_topic));
-    // Simpan tele base ke s_time sementara
-    strncpy(s_time, s_info_topic, sizeof(s_time)-1);
-    snprintf(s_info_topic, sizeof(s_info_topic), "%sINFO1", s_time);
+    // Bangun base topic "tele/topic/" ke s_info_topic dulu
+    char tele_base[96];
+    MqttConfig_BuildTopic(cfg, "tele", tele_base, sizeof(tele_base));
+
+    // INFO1
+    snprintf(s_info_topic, sizeof(s_info_topic), "%sINFO1", tele_base);
     snprintf(s_json, sizeof(s_json),
         "{\"Info1\":{\"Module\":\"STM32F103+W5500\",\"Version\":\"1.0.0\","
         "\"FallbackTopic\":\"cmnd/%s_fb/\",\"GroupTopic\":\"cmnd/stm32s/\"}}",
@@ -434,7 +457,7 @@ static void publish_info(const MqttConfig_t *cfg)
     MQTT_Publish(s_info_topic, (uint8_t *)s_json, (uint16_t)strlen(s_json));
 
     // INFO2
-    snprintf(s_info_topic, sizeof(s_info_topic), "%sINFO2", s_time);
+    snprintf(s_info_topic, sizeof(s_info_topic), "%sINFO2", tele_base);
     snprintf(s_json, sizeof(s_json),
         "{\"Info2\":{\"WebServerMode\":\"Admin\",\"Hostname\":\"%s\","
         "\"IPAddress\":\"%s\"}}",
@@ -442,7 +465,7 @@ static void publish_info(const MqttConfig_t *cfg)
     MQTT_Publish(s_info_topic, (uint8_t *)s_json, (uint16_t)strlen(s_json));
 
     // INFO3
-    snprintf(s_info_topic, sizeof(s_info_topic), "%sINFO3", s_time);
+    snprintf(s_info_topic, sizeof(s_info_topic), "%sINFO3", tele_base);
     snprintf(s_json, sizeof(s_json),
         "{\"Info3\":{\"RestartReason\":\"Power on\",\"BootCount\":1}}");
     MQTT_Publish(s_info_topic, (uint8_t *)s_json, (uint16_t)strlen(s_json));
@@ -452,17 +475,17 @@ static void publish_info(const MqttConfig_t *cfg)
 // =============================================================================
 // PUBLISH STATUS — persis Tasmota, disesuaikan STM32+W5500+CAN
 // =============================================================================
-static void build_stat_topic(const char *suffix, char *out, uint16_t len)
-{
-    // Bangun stat/topic/SUFFIXnya
-    MqttConfig_BuildTopic((const MqttConfig_t *)0, "stat", out, len);
-    // Tidak bisa pakai cfg di sini — pakai s_t_result sebagai base
-    // s_t_result = "stat/topic/RESULT" → ambil base sampai "RESULT"
-    uint16_t base_len = (uint16_t)(strrchr(s_t_result, '/') - s_t_result + 1);
-    memcpy(out, s_t_result, base_len);
-    out[base_len] = '\0';
-    strncat(out, suffix, len - base_len - 1);
-}
+//static void build_stat_topic(const char *suffix, char *out, uint16_t len)
+//{
+//    // Bangun stat/topic/SUFFIXnya
+//    MqttConfig_BuildTopic((const MqttConfig_t *)0, "stat", out, len);
+//    // Tidak bisa pakai cfg di sini — pakai s_t_result sebagai base
+//    // s_t_result = "stat/topic/RESULT" → ambil base sampai "RESULT"
+//    uint16_t base_len = (uint16_t)(strrchr(s_t_result, '/') - s_t_result + 1);
+//    memcpy(out, s_t_result, base_len);
+//    out[base_len] = '\0';
+//    strncat(out, suffix, len - base_len - 1);
+//}
 
 static void publish_status_n(const MqttConfig_t *cfg, uint8_t n)
 {
@@ -669,7 +692,14 @@ static void mqtt_handle_incoming(const MqttConfig_t *cfg)
 
     uint8_t type = s_buf[0] & 0xF0;
     if (type == MQTT_CONNACK) {
-        if (!s_buf[3]) { g_mqtt_conn_count++; g_mqtt_state = MQTT_STATE_CONNECTED; s_startup_step = 0; s_last_ping = s_last_pub = g_ms_tick; }
+        if (!s_buf[3])
+        {
+        	g_mqtt_conn_count++;
+        	g_mqtt_state = MQTT_STATE_CONNECTED;
+        	s_startup_step = 0;
+        	 s_startup_tick  = g_ms_tick;
+        	s_last_ping = s_last_pub = g_ms_tick;
+        }
         else { g_mqtt_state = MQTT_STATE_RECONNECT; s_tick_ref = g_ms_tick; }
         return;
     }
@@ -858,6 +888,10 @@ void MQTT_Process(const MqttConfig_t *cfg)
                 break;
             }
 
+
+            if ((g_ms_tick - s_startup_tick) < 200) break;
+            s_startup_tick = g_ms_tick;
+
             // Startup sequence — kirim satu per satu tiap loop
             // agar tidak overflow TX buffer 2KB
             if (s_startup_step < 6) {
@@ -868,7 +902,8 @@ void MQTT_Process(const MqttConfig_t *cfg)
                         mqtt_subscribe(s_json);
                         break;
                     case 1:
-                        MQTT_Publish(s_t_lwt, (uint8_t *)"Online", 6);
+//                        MQTT_Publish(s_t_lwt, (uint8_t *)"Online", 6);
+                    	 mqtt_publish_retain(s_t_lwt, (uint8_t *)"Online", 6);
                         break;
                     case 2:
                         publish_info(cfg);

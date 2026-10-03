@@ -1,5 +1,6 @@
 #include "web_config.h"
 #include "mqtt_config.h"
+#include "html_flash.h"
 #include "main.h"
 #include <string.h>
 #include <stdio.h>
@@ -11,189 +12,7 @@
 extern void W5500_SendTCP(const uint8_t *data, uint16_t len);
 uint8_t g_config_updated = 0;
 
-// =============================================================================
-// HTML — persis Tasmota MQTT Config page
-// Dark theme, layout 2-kolom untuk field pendek (port, teleperiod)
-// =============================================================================
-static const char HTML_CONFIG_PAGE[] =
-"<!DOCTYPE html>"
-"<html>"
-"<head>"
-"<meta charset='UTF-8'>"
-"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>STM32 - Configuration MQTT</title>"
-"<style>"
-"*{box-sizing:border-box}"
-"body{font-family:'Segoe UI',Arial,sans-serif;background:#1e1e1e;color:#ddd;"
-"margin:0;padding:0;font-size:14px}"
-"/* Header bar mirip Tasmota */"
-".header{background:#1fa3ec;padding:10px 16px;display:flex;"
-"align-items:center;justify-content:space-between}"
-".header h3{margin:0;color:#fff;font-size:16px;font-weight:600}"
-".header .sub{color:#cde;font-size:11px}"
-"/* Navigation tabs */"
-".nav{background:#282828;padding:0 12px;display:flex;gap:2px;flex-wrap:wrap}"
-".nav a{color:#aaa;text-decoration:none;padding:8px 12px;font-size:12px;"
-"border-bottom:2px solid transparent;display:block}"
-".nav a.active{color:#1fa3ec;border-bottom-color:#1fa3ec}"
-".nav a:hover{color:#fff}"
-"/* Main content */"
-".main{max-width:480px;margin:0 auto;padding:16px}"
-"/* Section title */"
-".sect{font-size:11px;font-weight:700;color:#1fa3ec;letter-spacing:1px;"
-"text-transform:uppercase;margin:18px 0 8px;border-bottom:1px solid #333;padding-bottom:4px}"
-"/* Field row */"
-".field{margin-bottom:10px}"
-".field label{display:block;font-size:12px;color:#999;margin-bottom:3px}"
-".field input[type=text],.field input[type=password],.field input[type=number]{"
-"width:100%;padding:6px 8px;background:#2d2d2d;border:1px solid #444;"
-"border-radius:3px;color:#ddd;font-size:13px;outline:none}"
-".field input:focus{border-color:#1fa3ec;background:#333}"
-"/* 2-kolom */"
-".row2{display:flex;gap:10px}"
-".row2 .field{flex:1}"
-"/* Topic preview box */"
-".preview{background:#1a1a1a;border:1px solid #333;border-radius:3px;"
-"padding:8px 10px;font-size:11px;font-family:monospace;color:#888;margin-top:6px}"
-".preview span{color:#1fa3ec}"
-"/* Checkbox toggle */"
-".toggle{display:flex;align-items:center;gap:8px;padding:4px 0}"
-".toggle input{width:16px;height:16px;cursor:pointer;accent-color:#1fa3ec}"
-".toggle label{font-size:13px;color:#ccc;cursor:pointer;margin:0}"
-"/* Buttons */"
-".btns{margin-top:20px;display:flex;gap:8px}"
-".btn{flex:1;padding:9px;border:none;border-radius:3px;font-size:13px;"
-"cursor:pointer;font-weight:600}"
-".btn-save{background:#1fa3ec;color:#fff}"
-".btn-save:hover{background:#1b8fd4}"
-".btn-reset{background:#e74c3c;color:#fff}"
-".btn-reset:hover{background:#c0392b}"
-"/* Status message */"
-"#msg{margin-top:10px;padding:8px 10px;border-radius:3px;font-size:12px;"
-"display:none;text-align:center}"
-".msg-ok{background:#1e3d1e;color:#4caf50;border:1px solid #2e5c2e}"
-".msg-err{background:#3d1e1e;color:#f44336;border:1px solid #5c2e2e}"
-".msg-info{background:#1e2d3d;color:#2196f3;border:1px solid #2e3d5c}"
-"/* Topic info */"
-".tinfo{font-size:11px;color:#666;margin-top:4px;line-height:1.6}"
-".tinfo b{color:#1fa3ec}"
-"/* Footer */"
-".footer{text-align:center;padding:20px;font-size:11px;color:#444}"
-"</style>"
-"</head>"
-"<body>"
-"<div class='header'>"
-"<div>"
-"<h3>&#9881; STM32 W5500</h3>"
-"<div class='sub'>MQTT Configuration</div>"
-"</div>"
-"</div>"
-"<div class='nav'>"
-"<a href='/'>&#8962; Main</a>"
-"<a href='/config' class='active'>&#9889; MQTT</a>"
-"</div>"
-"<div class='main'>"
-"<div class='sect'>MQTT Broker</div>"
-"<div class='field'><label>Host</label>"
-"<input type='text' id='host' maxlength='63' placeholder='192.168.1.100'></div>"
-"<div class='row2'>"
-"<div class='field'><label>Port</label>"
-"<input type='number' id='port' min='1' max='65535' placeholder='1883'></div>"
-"<div class='field'><label>TelePeriod (s)</label>"
-"<input type='number' id='tele' min='10' max='3600' placeholder='300'></div>"
-"</div>"
-"<div class='field'><label>Client</label>"
-"<input type='text' id='cid' maxlength='31' placeholder='STM32_W5500'></div>"
-"<div class='field'><label>User</label>"
-"<input type='text' id='user' maxlength='31' placeholder='(kosong jika tidak perlu)'></div>"
-"<div class='field'><label>Password</label>"
-"<input type='password' id='pass' maxlength='31'></div>"
-"<div class='sect'>MQTT Topic</div>"
-"<div class='field'><label>Topic</label>"
-"<input type='text' id='topic' maxlength='31' placeholder='stm32'"
-" oninput='updatePreview()'></div>"
-"<div class='field'><label>Full Topic</label>"
-"<input type='text' id='ftopic' maxlength='63' placeholder='%prefix%/%topic%/'"
-" oninput='updatePreview()'></div>"
-"<div class='preview' id='prev'>"
-"<div class='tinfo'>"
-"Subscribe: <b id='p_cmnd'>cmnd/stm32/</b><br>"
-"Publish stat: <b id='p_stat'>stat/stm32/</b><br>"
-"Publish tele: <b id='p_tele'>tele/stm32/</b>"
-"</div>"
-"</div>"
-"<div class='sect'>Status</div>"
-"<div class='toggle'>"
-"<input type='checkbox' id='en'>"
-"<label for='en'>MQTT Enabled</label>"
-"</div>"
-"<div class='btns'>"
-"<button class='btn btn-save' onclick='save()'>&#128190; Save</button>"
-"<button class='btn btn-reset' onclick='resetDef()'>&#8635; Default</button>"
-"</div>"
-"<div id='msg'></div>"
-"</div>"
-"<div class='footer'>STM32F103 + W5500 &bull; Tasmota Style</div>"
-"<script>"
-"function buildTopic(prefix,topic,ftopic){"
-"return ftopic.replace('%prefix%',prefix).replace('%topic%',topic);}"
-"function updatePreview(){"
-"let t=document.getElementById('topic').value||'stm32';"
-"let ft=document.getElementById('ftopic').value||'%prefix%/%topic%/';"
-"document.getElementById('p_cmnd').innerText=buildTopic('cmnd',t,ft);"
-"document.getElementById('p_stat').innerText=buildTopic('stat',t,ft);"
-"document.getElementById('p_tele').innerText=buildTopic('tele',t,ft);}"
-"async function load(){"
-"try{"
-"let r=await fetch('/config/data');"
-"if(!r.ok)return;"
-"let d=await r.json();"
-"document.getElementById('host').value=d.host||'';"
-"document.getElementById('port').value=d.port||1883;"
-"document.getElementById('cid').value=d.client_id||'';"
-"document.getElementById('user').value=d.user||'';"
-"document.getElementById('pass').value=d.password||'';"
-"document.getElementById('topic').value=d.topic||'';"
-"document.getElementById('ftopic').value=d.full_topic||'%prefix%/%topic%/';"
-"document.getElementById('tele').value=d.tele_period||300;"
-"document.getElementById('en').checked=d.enabled==1;"
-"updatePreview();"
-"}catch(e){}}"
-"function resetDef(){"
-"document.getElementById('host').value='192.168.1.100';"
-"document.getElementById('port').value=1883;"
-"document.getElementById('cid').value='STM32_W5500';"
-"document.getElementById('user').value='';"
-"document.getElementById('pass').value='';"
-"document.getElementById('topic').value='stm32';"
-"document.getElementById('ftopic').value='%prefix%/%topic%/';"
-"document.getElementById('tele').value=300;"
-"document.getElementById('en').checked=true;"
-"updatePreview();}"
-"async function save(){"
-"let m=document.getElementById('msg');"
-"m.style.display='block';m.className='msg-info';"
-"m.innerText='Menyimpan...';"
-"let fd=new URLSearchParams();"
-"fd.append('host',document.getElementById('host').value);"
-"fd.append('port',document.getElementById('port').value);"
-"fd.append('client_id',document.getElementById('cid').value);"
-"fd.append('user',document.getElementById('user').value);"
-"fd.append('password',document.getElementById('pass').value);"
-"fd.append('topic',document.getElementById('topic').value);"
-"fd.append('full_topic',document.getElementById('ftopic').value);"
-"fd.append('tele_period',document.getElementById('tele').value);"
-"fd.append('enabled',document.getElementById('en').checked?'1':'0');"
-"try{"
-"let r=await fetch('/config',{method:'POST',body:fd.toString(),"
-"headers:{'Content-Type':'application/x-www-form-urlencoded'}});"
-"let t=await r.text();"
-"if(r.ok){m.className='msg-ok';m.innerText='\u2713 '+t;}"
-"else{m.className='msg-err';m.innerText='Gagal: '+t;}"
-"}catch(e){m.className='msg-err';m.innerText='Error: '+e;}}"
-"document.addEventListener('DOMContentLoaded',load);"
-"</script>"
-"</body></html>";
+// HTML_CONFIG_PAGE dihapus — halaman di-serve dari SPI Flash via HtmlFlash_SendPage()
 
 // =============================================================================
 // HELPER: URL decode
@@ -303,34 +122,12 @@ static void send_config_json(void)
     W5500_SendTCP((uint8_t *)json, (uint16_t)strlen(json));
 }
 
-uint32_t g_html_config_size = 0;
 // =============================================================================
-// HELPER: Stream HTML dari ROM ke TCP 256 byte per chunk
+// HELPER: Kirim HTML dari SPI Flash ke TCP
 // =============================================================================
 static void send_html_page(void)
 {
-    uint16_t total = (uint16_t)strlen(HTML_CONFIG_PAGE);
-
-    char hdr[128];
-    snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n\r\n",
-        total);
-    W5500_SendTCP((uint8_t *)hdr, (uint16_t)strlen(hdr));
-
-    const char *ptr       = HTML_CONFIG_PAGE;
-
-    g_html_config_size = sizeof(HTML_CONFIG_PAGE);
-
-    uint16_t    remaining = total;
-    while (remaining > 0) {
-        uint16_t chunk = (remaining > 256) ? 256 : remaining;
-        W5500_SendTCP((uint8_t *)ptr, chunk);
-        ptr       += chunk;
-        remaining -= chunk;
-    }
+    HtmlFlash_SendPage();
 }
 
 // =============================================================================
